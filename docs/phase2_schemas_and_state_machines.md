@@ -1063,8 +1063,8 @@ GRANT EXECUTE ON FUNCTION advance_store_epoch(TEXT, TIMESTAMPTZ) TO ledger_app, 
 CREATE TABLE ledger_snapshots (
     snapshot_id       BIGSERIAL   PRIMARY KEY,
     pg_snapshot_text  TEXT        NOT NULL,
-    xmin              xid8        NOT NULL,
-    xmax              xid8        NOT NULL,
+    snap_xmin         xid8        NOT NULL,
+    snap_xmax         xid8        NOT NULL,
     read_model_sha256 TEXT        NOT NULL,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -1345,7 +1345,7 @@ DECLARE
     v_snap    pg_snapshot := pg_current_snapshot();
     v_snap_id BIGINT;
 BEGIN
-    INSERT INTO ledger_snapshots (pg_snapshot_text, xmin, xmax, read_model_sha256)
+    INSERT INTO ledger_snapshots (pg_snapshot_text, snap_xmin, snap_xmax, read_model_sha256)
     VALUES (v_snap::TEXT, pg_snapshot_xmin(v_snap), pg_snapshot_xmax(v_snap), p_read_model_sha256)
     RETURNING snapshot_id INTO v_snap_id;
 
