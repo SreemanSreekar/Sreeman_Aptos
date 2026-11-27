@@ -4,7 +4,7 @@ services:
     container_name: ledger-postgres
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres_dev_password
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres_dev_password}"
       POSTGRES_DB: ledger
     ports:
       - "${POSTGRES_HOST_PORT:-5433}:5432"
@@ -25,9 +25,9 @@ services:
     environment:
       PORT: "8080"
       REPLICA_ID: "api-1"
-      DATABASE_URL: "postgres://ledger_app:ledger_app_dev_pw@postgres:5432/ledger?sslmode=disable"
-      ADMIN_DATABASE_URL: "postgres://ledger_admin:ledger_admin_dev_pw@postgres:5432/ledger?sslmode=disable"
-      ALLOW_SIMULATED_CLOCK: "${ALLOW_SIMULATED_CLOCK:-true}"
+      DATABASE_URL: "postgres://ledger_app:${LEDGER_APP_PASSWORD:-ledger_app_dev_pw}@postgres:5432/ledger?sslmode=disable"
+      ADMIN_DATABASE_URL: "postgres://ledger_admin:${LEDGER_ADMIN_PASSWORD:-ledger_admin_dev_pw}@postgres:5432/ledger?sslmode=disable"
+      ALLOW_SIMULATED_CLOCK: "${ALLOW_SIMULATED_CLOCK:-false}"
       MAX_FUTURE_SKEW_SECONDS: "300"
       MAX_EVENT_LATENESS_HOURS: "48"
     depends_on:
@@ -47,9 +47,9 @@ services:
     environment:
       PORT: "8080"
       REPLICA_ID: "api-2"
-      DATABASE_URL: "postgres://ledger_app:ledger_app_dev_pw@postgres:5432/ledger?sslmode=disable"
-      ADMIN_DATABASE_URL: "postgres://ledger_admin:ledger_admin_dev_pw@postgres:5432/ledger?sslmode=disable"
-      ALLOW_SIMULATED_CLOCK: "${ALLOW_SIMULATED_CLOCK:-true}"
+      DATABASE_URL: "postgres://ledger_app:${LEDGER_APP_PASSWORD:-ledger_app_dev_pw}@postgres:5432/ledger?sslmode=disable"
+      ADMIN_DATABASE_URL: "postgres://ledger_admin:${LEDGER_ADMIN_PASSWORD:-ledger_admin_dev_pw}@postgres:5432/ledger?sslmode=disable"
+      ALLOW_SIMULATED_CLOCK: "${ALLOW_SIMULATED_CLOCK:-false}"
       MAX_FUTURE_SKEW_SECONDS: "300"
       MAX_EVENT_LATENESS_HOURS: "48"
     depends_on:
@@ -73,6 +73,11 @@ services:
         condition: service_healthy
       api-2:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
 
 volumes:
   pgdata:

@@ -40,11 +40,17 @@ func BusinessDay(t time.Time, loc *time.Location) time.Time {
 }
 
 // CutoffUTC returns the exact UTC instant when businessDay closes (02:00:00 store-local on businessDay + 1).
-// Handles DST spring-forward gaps and fall-back folds deterministically via Go's time.Date.
+// Handles DST spring-forward gaps (resolving to the first valid instant at/after 02:00 local, e.g. 03:00 EDT)
+// and fall-back folds deterministically.
 func CutoffUTC(businessDay time.Time, loc *time.Location) time.Time {
 	next := businessDay.AddDate(0, 0, 1)
 	y, m, d := next.Date()
 	cutoffLocal := time.Date(y, m, d, 2, 0, 0, 0, loc)
+	// On a spring-forward gap where 02:00 local does not exist, Go's time.Date rolls backward
+	// into 01:xx standard time; advance to the first valid post-gap instant (e.g. 03:00 DST).
+	if cutoffLocal.In(loc).Hour() < 2 {
+		cutoffLocal = cutoffLocal.Add(time.Hour)
+	}
 	return cutoffLocal.UTC().Truncate(time.Microsecond)
 }
 
