@@ -1,12 +1,16 @@
 import asyncio
+import os
 import uuid
 import httpx
 import psycopg
 import pytest
 
-BASE = "http://localhost:8080"
-ADMIN_DSN = "postgresql://ledger_admin:ledger_admin_dev_pw@127.0.0.1:5433/ledger"
-APP_DSN = "postgresql://ledger_app:ledger_app_dev_pw@127.0.0.1:5433/ledger"
+BASE = os.getenv("LEDGER_BASE_URL", "http://localhost:8080")
+PG_PORT = os.getenv("POSTGRES_HOST_PORT", "5433")
+ADMIN_PW = os.getenv("LEDGER_ADMIN_PASSWORD", "ledger_admin_dev_pw")
+APP_PW = os.getenv("LEDGER_APP_PASSWORD", "ledger_app_dev_pw")
+ADMIN_DSN = f"postgresql://ledger_admin:{ADMIN_PW}@127.0.0.1:{PG_PORT}/ledger"
+APP_DSN = f"postgresql://ledger_app:{APP_PW}@127.0.0.1:{PG_PORT}/ledger"
 
 
 @pytest.fixture(scope="module", autouse=True)

@@ -5,14 +5,14 @@
 
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- 1. Roles & Schema Privileges
+-- 1. Roles & Schema Privileges (passwords configured by 000_roles.sh from env vars)
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ledger_admin') THEN
-        CREATE ROLE ledger_admin LOGIN PASSWORD 'ledger_admin_dev_pw';
+        CREATE ROLE ledger_admin LOGIN;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ledger_app') THEN
-        CREATE ROLE ledger_app LOGIN PASSWORD 'ledger_app_dev_pw';
+        CREATE ROLE ledger_app LOGIN;
     END IF;
 END
 $$;

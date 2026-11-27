@@ -6,10 +6,13 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres_dev_password}"
       POSTGRES_DB: ledger
+      LEDGER_APP_PASSWORD: "${LEDGER_APP_PASSWORD:-ledger_app_dev_pw}"
+      LEDGER_ADMIN_PASSWORD: "${LEDGER_ADMIN_PASSWORD:-ledger_admin_dev_pw}"
     ports:
       - "${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./migrations/000_roles.sh:/docker-entrypoint-initdb.d/000_roles.sh:ro
       - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d ledger"]
