@@ -25,14 +25,109 @@ type prefixSaleEvent struct {
 	AmountMinor       int64
 }
 
+type evalResult struct {
+	ev          prefixSaleEvent
+	newStatus   string // APPLIED or REJECTED_INVALID
+	rejectCode  *string
+	signedDelta int64 // +amt for sale, -amt for return/void if APPLIED, else 0
+}
+
+// evaluateSalePrefix runs the pure, arrival-order-independent per-sale state machine
+// over events sorted in canonical (occurred_at ASC, event_id ASC) order.
+func evaluateSalePrefix(events []prefixSaleEvent, primarySale *prefixSaleEvent) (string, int64, []evalResult) {
+	saleStatus := "ACTIVE"
+	origAmount := primarySale.AmountMinor
+	var returnedAmount int64
+	saleStore := primarySale.StoreID
+
+	results := make([]evalResult, 0, len(events))
+	seenPrimarySale := false
+
+	for _, ev := range events {
+		switch ev.EventType {
+		case "sale":
+			if !seenPrimarySale && ev.EventID == primarySale.EventID {
+				seenPrimarySale = true
+				results = append(results, evalResult{
+					ev:          ev,
+					newStatus:   "APPLIED",
+					signedDelta: ev.AmountMinor,
+				})
+			} else {
+				reason := "DUPLICATE_SALE_ID"
+				results = append(results, evalResult{
+					ev:          ev,
+					newStatus:   "REJECTED_INVALID",
+					rejectCode:  &reason,
+					signedDelta: 0,
+				})
+			}
+
+		case "return":
+			switch saleStatus {
+			case "VOIDED":
+				reason := "CANNOT_RETURN_VOIDED_SALE"
+				results = append(results, evalResult{ev: ev, newStatus: "REJECTED_INVALID", rejectCode: &reason})
+			case "FULLY_RETURNED":
+				reason := "ALREADY_FULLY_RETURNED"
+				results = append(results, evalResult{ev: ev, newStatus: "REJECTED_INVALID", rejectCode: &reason})
+			case "ACTIVE", "PARTIALLY_RETURNED":
+				if ev.AmountMinor <= 0 || returnedAmount+ev.AmountMinor > origAmount {
+					reason := "RETURN_EXCEEDS_REMAINING"
+					results = append(results, evalResult{ev: ev, newStatus: "REJECTED_INVALID", rejectCode: &reason})
+				} else {
+					returnedAmount += ev.AmountMinor
+					if returnedAmount == origAmount {
+						saleStatus = "FULLY_RETURNED"
+					} else {
+						saleStatus = "PARTIALLY_RETURNED"
+					}
+					results = append(results, evalResult{
+						ev:          ev,
+						newStatus:   "APPLIED",
+						signedDelta: -ev.AmountMinor,
+					})
+				}
+			}
+
+		case "void":
+			switch saleStatus {
+			case "VOIDED":
+				reason := "ALREADY_VOIDED"
+				results = append(results, evalResult{ev: ev, newStatus: "REJECTED_INVALID", rejectCode: &reason})
+			case "PARTIALLY_RETURNED", "FULLY_RETURNED":
+				reason := "CANNOT_VOID_RETURNED_SALE"
+				results = append(results, evalResult{ev: ev, newStatus: "REJECTED_INVALID", rejectCode: &reason})
+			case "ACTIVE":
+				if ev.StoreID != saleStore {
+					reason := "VOID_STORE_MISMATCH"
+					results = append(results, evalResult{ev: ev, newStatus: "REJECTED_INVALID", rejectCode: &reason})
+				} else if ev.AmountMinor != origAmount {
+					reason := "INVALID_AMOUNT"
+					results = append(results, evalResult{ev: ev, newStatus: "REJECTED_INVALID", rejectCode: &reason})
+				} else {
+					saleStatus = "VOIDED"
+					results = append(results, evalResult{
+						ev:          ev,
+						newStatus:   "APPLIED",
+						signedDelta: -ev.AmountMinor,
+					})
+				}
+			}
+		}
+	}
+
+	return saleStatus, returnedAmount, results
+}
+
 type priorAppState struct {
-	Exists          bool
-	Status          string
-	AppliedAmount   int64
-	AppliedStoreID  *string
-	AppliedPostDay  *time.Time
-	AppliedIsAdj    bool
-	ResolvedAtUTC   *time.Time
+	Exists         bool
+	Status         string
+	AppliedAmount  int64
+	AppliedStoreID *string
+	AppliedPostDay *time.Time
+	AppliedIsAdj   bool
+	ResolvedAtUTC  *time.Time
 }
 
 // ProjectSaleEvent implements the prefix-scoped (applied_order <= e.AppliedOrder),
@@ -133,95 +228,10 @@ func ProjectSaleEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) erro
 	}
 
 	// 5. Walk canonical (occurred_at ASC, event_id ASC) prefix through per-sale state machine.
-	saleStatus := "ACTIVE"
 	origAmount := primarySale.AmountMinor
-	var returnedAmount int64
 	saleStore := primarySale.StoreID
 	saleOriginDay := primarySale.OriginBusinessDay
-
-	type evalResult struct {
-		ev          prefixSaleEvent
-		newStatus   string // APPLIED or REJECTED_INVALID
-		rejectCode  *string
-		signedDelta int64 // +amt for sale, -amt for return/void if APPLIED, else 0
-	}
-
-	results := make([]evalResult, 0, len(events))
-	seenPrimarySale := false
-
-	for _, ev := range events {
-		switch ev.EventType {
-		case "sale":
-			if !seenPrimarySale && ev.EventID == primarySale.EventID {
-				seenPrimarySale = true
-				results = append(results, evalResult{
-					ev:          ev,
-					newStatus:   "APPLIED",
-					signedDelta: ev.AmountMinor,
-				})
-			} else {
-				reason := "DUPLICATE_SALE_ID"
-				results = append(results, evalResult{
-					ev:          ev,
-					newStatus:   "REJECTED_INVALID",
-					rejectCode:  &reason,
-					signedDelta: 0,
-				})
-			}
-
-		case "return":
-			switch saleStatus {
-			case "VOIDED":
-				reason := "CANNOT_RETURN_VOIDED_SALE"
-				results = append(results, evalResult{ev: ev, newStatus: "REJECTED_INVALID", rejectCode: &reason})
-			case "FULLY_RETURNED":
-				reason := "ALREADY_FULLY_RETURNED"
-				results = append(results, evalResult{ev: ev, newStatus: "REJECTED_INVALID", rejectCode: &reason})
-			case "ACTIVE", "PARTIALLY_RETURNED":
-				if ev.AmountMinor <= 0 || returnedAmount+ev.AmountMinor > origAmount {
-					reason := "RETURN_EXCEEDS_REMAINING"
-					results = append(results, evalResult{ev: ev, newStatus: "REJECTED_INVALID", rejectCode: &reason})
-				} else {
-					returnedAmount += ev.AmountMinor
-					if returnedAmount == origAmount {
-						saleStatus = "FULLY_RETURNED"
-					} else {
-						saleStatus = "PARTIALLY_RETURNED"
-					}
-					results = append(results, evalResult{
-						ev:          ev,
-						newStatus:   "APPLIED",
-						signedDelta: -ev.AmountMinor,
-					})
-				}
-			}
-
-		case "void":
-			switch saleStatus {
-			case "VOIDED":
-				reason := "ALREADY_VOIDED"
-				results = append(results, evalResult{ev: ev, newStatus: "REJECTED_INVALID", rejectCode: &reason})
-			case "PARTIALLY_RETURNED", "FULLY_RETURNED":
-				reason := "CANNOT_VOID_RETURNED_SALE"
-				results = append(results, evalResult{ev: ev, newStatus: "REJECTED_INVALID", rejectCode: &reason})
-			case "ACTIVE":
-				if ev.StoreID != saleStore {
-					reason := "VOID_STORE_MISMATCH"
-					results = append(results, evalResult{ev: ev, newStatus: "REJECTED_INVALID", rejectCode: &reason})
-				} else if ev.AmountMinor != origAmount {
-					reason := "INVALID_AMOUNT"
-					results = append(results, evalResult{ev: ev, newStatus: "REJECTED_INVALID", rejectCode: &reason})
-				} else {
-					saleStatus = "VOIDED"
-					results = append(results, evalResult{
-						ev:          ev,
-						newStatus:   "APPLIED",
-						signedDelta: -ev.AmountMinor,
-					})
-				}
-			}
-		}
-	}
+	saleStatus, returnedAmount, results := evaluateSalePrefix(events, primarySale)
 
 	// 6. Compare each event's desired effect against event_application_status and book
 	//    initial postings or RECLASSIFICATION deltas without ever mutating closed days.
