@@ -477,10 +477,19 @@ func IngestPreparedEventsInTx(
 		claimedReceipts[ev.EventID] = true
 	}
 
-	// 3. Canonical entity lock acquisition in global table order: sales -> gift_cards -> loyalty_accounts
+	// 3. Canonical entity lock acquisition in global table order:
+	//    sales -> store_business_days -> gift_cards -> loyalty_accounts
 	saleIDSet := make(map[uuid.UUID]struct{})
 	cardIDSet := make(map[string]struct{})
 	acctIDSet := make(map[string]struct{})
+	locCache := make(map[string]*time.Location)
+	type storeDayKey struct {
+		storeID string
+		day     time.Time
+		dayStr  string
+	}
+	dayKeyMap := make(map[string]storeDayKey)
+
 	for _, ev := range events {
 		if skipEvent[ev.EventID] {
 			continue
@@ -494,6 +503,22 @@ func IngestPreparedEventsInTx(
 		if ev.AccountID != nil {
 			acctIDSet[*ev.AccountID] = struct{}{}
 		}
+		loc, ok := locCache[ev.StoreID]
+		if !ok {
+			var err error
+			loc, _, err = days.LoadStoreLocation(ctx, tx, ev.StoreID)
+			if err != nil {
+				return summary, &HTTPError{Status: http.StatusNotFound, Code: "STORE_NOT_FOUND", Message: err.Error()}
+			}
+			locCache[ev.StoreID] = loc
+		}
+		origDay := clock.BusinessDay(ev.OccurredAt, loc)
+		origStr := origDay.Format("2006-01-02")
+		dayKeyMap[ev.StoreID+"|"+origStr] = storeDayKey{storeID: ev.StoreID, day: origDay, dayStr: origStr}
+
+		currDay := clock.BusinessDay(ingestNow, loc)
+		currStr := currDay.Format("2006-01-02")
+		dayKeyMap[ev.StoreID+"|"+currStr] = storeDayKey{storeID: ev.StoreID, day: currDay, dayStr: currStr}
 	}
 
 	sortedSales := make([]uuid.UUID, 0, len(saleIDSet))
@@ -506,6 +531,23 @@ func IngestPreparedEventsInTx(
 			return summary, err
 		}
 		if _, err := tx.Exec(ctx, `SELECT 1 FROM sales WHERE sale_id = $1 FOR UPDATE`, sid); err != nil {
+			return summary, err
+		}
+	}
+
+	// Pre-lock store_business_days in sorted (store_id, business_day) order before gift_cards/loyalty_accounts
+	sortedDays := make([]storeDayKey, 0, len(dayKeyMap))
+	for _, dk := range dayKeyMap {
+		sortedDays = append(sortedDays, dk)
+	}
+	sort.Slice(sortedDays, func(i, j int) bool {
+		if sortedDays[i].storeID != sortedDays[j].storeID {
+			return sortedDays[i].storeID < sortedDays[j].storeID
+		}
+		return sortedDays[i].dayStr < sortedDays[j].dayStr
+	})
+	for _, dk := range sortedDays {
+		if _, _, err := days.EnsureOpenDayRow(ctx, tx, dk.storeID, locCache[dk.storeID], dk.day); err != nil {
 			return summary, err
 		}
 	}
@@ -544,22 +586,13 @@ func IngestPreparedEventsInTx(
 	}
 
 	// 4. Insert pre-sorted events into ledger_events with post-lock applied_order
-	locCache := make(map[string]*time.Location)
 	insertedRecords := make([]ledger.EventRecord, 0, len(events))
 
 	for _, ev := range events {
 		if skipEvent[ev.EventID] {
 			continue
 		}
-		loc, ok := locCache[ev.StoreID]
-		if !ok {
-			var err error
-			loc, _, err = days.LoadStoreLocation(ctx, tx, ev.StoreID)
-			if err != nil {
-				return summary, &HTTPError{Status: http.StatusNotFound, Code: "STORE_NOT_FOUND", Message: err.Error()}
-			}
-			locCache[ev.StoreID] = loc
-		}
+		loc := locCache[ev.StoreID]
 		origDay := clock.BusinessDay(ev.OccurredAt, loc)
 		origCutoff := clock.CutoffUTC(origDay, loc)
 

@@ -18,7 +18,9 @@ def seed_stores():
     with psycopg.connect(ADMIN_DSN, autocommit=True) as conn:
         conn.execute("UPDATE ledger_config SET allow_simulated_clock = true WHERE id = 1")
         conn.execute("SELECT admin_seed_store('store-p1-a', 'America/New_York', ARRAY['term-1', 'term-2'], '2026-11-20T12:00:00Z'::timestamptz)")
+        conn.execute("SELECT admin_seed_store('store-p1-b', 'America/New_York', ARRAY['term-1'], '2026-11-20T12:00:00Z'::timestamptz)")
         conn.execute("SELECT admin_seed_store('store-p1-dst', 'America/New_York', ARRAY['term-1'], '2026-03-07T12:00:00Z'::timestamptz)")
+        conn.execute("SELECT admin_seed_store('store-p1-50rps', 'America/New_York', ARRAY['term-1', 'term-2'], '2026-11-20T12:00:00Z'::timestamptz)")
 
 
 def test_healthz_and_client_channel_rejected():
@@ -176,3 +178,122 @@ async def test_concurrent_two_replica_duplicates_and_orphan_race():
         assert tot["totals"]["sales_minor"] == 25000, tot
         assert tot["totals"]["returns_minor"] == 10000, tot
         assert tot["totals"]["net_total_minor"] == 15000, tot
+
+
+def test_all_per_sale_state_transitions():
+    """Verify DUPLICATE_SALE_ID, multiple partial returns -> FULLY_RETURNED, RETURN_EXCEEDS_REMAINING,
+    CANNOT_VOID_RETURNED_SALE, and VOID_STORE_MISMATCH."""
+    fri_now = "2026-11-27T16:00:00Z"
+    s1 = str(uuid.uuid4())
+    s2 = str(uuid.uuid4())
+
+    with httpx.Client(base_url=BASE, timeout=15.0) as c:
+        # Primary sale + duplicate sale_id with distinct event_id
+        r = c.post("/v1/batches", headers={"X-Simulated-Now": fri_now}, json={
+            "batch_id": str(uuid.uuid4()), "store_id": "store-p1-b", "terminal_id": "term-1",
+            "events": [
+                {"event_id": s1, "sale_id": s1, "event_type": "sale", "occurred_at": "2026-11-27T15:00:00Z", "amount_minor": 1000},
+                {"event_id": str(uuid.uuid4()), "sale_id": s1, "event_type": "sale", "occurred_at": "2026-11-27T15:01:00Z", "amount_minor": 1000},
+            ],
+        })
+        assert r.status_code == 200 and r.json()["accepted"] == 1 and r.json()["rejected_invalid"] == 1
+
+        # Partial return 400 -> PARTIALLY_RETURNED, attempt void (CANNOT_VOID_RETURNED_SALE),
+        # attempt over-return 700 (RETURN_EXCEEDS_REMAINING), exact remaining 600 -> FULLY_RETURNED
+        r = c.post("/v1/batches", headers={"X-Simulated-Now": fri_now}, json={
+            "batch_id": str(uuid.uuid4()), "store_id": "store-p1-b", "terminal_id": "term-1",
+            "events": [
+                {"event_id": str(uuid.uuid4()), "event_type": "return", "parent_sale_id": s1, "occurred_at": "2026-11-27T15:02:00Z", "amount_minor": 400},
+                {"event_id": str(uuid.uuid4()), "event_type": "void", "parent_sale_id": s1, "occurred_at": "2026-11-27T15:03:00Z", "amount_minor": 1000},
+                {"event_id": str(uuid.uuid4()), "event_type": "return", "parent_sale_id": s1, "occurred_at": "2026-11-27T15:04:00Z", "amount_minor": 700},
+                {"event_id": str(uuid.uuid4()), "event_type": "return", "parent_sale_id": s1, "occurred_at": "2026-11-27T15:05:00Z", "amount_minor": 600},
+            ],
+        })
+        assert r.status_code == 200 and r.json()["accepted"] == 2 and r.json()["rejected_invalid"] == 2
+
+        # Cross-store void rejected (VOID_STORE_MISMATCH)
+        assert c.post("/v1/batches", headers={"X-Simulated-Now": fri_now}, json={
+            "batch_id": str(uuid.uuid4()), "store_id": "store-p1-b", "terminal_id": "term-1",
+            "events": [{"event_id": s2, "event_type": "sale", "occurred_at": "2026-11-27T15:10:00Z", "amount_minor": 800}],
+        }).status_code == 200
+        r = c.post("/v1/batches", headers={"X-Simulated-Now": fri_now}, json={
+            "batch_id": str(uuid.uuid4()), "store_id": "store-p1-a", "terminal_id": "term-1",
+            "events": [{"event_id": str(uuid.uuid4()), "event_type": "void", "parent_sale_id": s2, "occurred_at": "2026-11-27T15:11:00Z", "amount_minor": 800}],
+        })
+        assert r.status_code == 200 and r.json()["rejected_invalid"] == 1
+
+
+def test_cross_closed_day_reclassification_and_lazy_close():
+    """Monday sale+return posted while Monday is OPEN; Tuesday 09:00 late earlier void arrives
+    (without explicit /close -> triggers lazy close of Monday!) -> Monday stays untouched (+7000),
+    Tuesday gets +3000 RECLASSIFICATION and -10000 LATE_POSTING void (net = -7000, overall economic net = 0)."""
+    s_id = str(uuid.uuid4())
+    r_id = str(uuid.uuid4())
+    v_id = str(uuid.uuid4())
+
+    with httpx.Client(base_url=BASE, timeout=15.0) as c:
+        # Mon 10:00 EST: sale 10000 + return 3000 -> Mon net = 7000
+        assert c.post("/v1/batches", headers={"X-Simulated-Now": "2026-11-23T15:10:00Z"}, json={
+            "batch_id": str(uuid.uuid4()), "store_id": "store-p1-b", "terminal_id": "term-1",
+            "events": [
+                {"event_id": s_id, "event_type": "sale", "occurred_at": "2026-11-23T15:00:00Z", "amount_minor": 10000},
+                {"event_id": r_id, "event_type": "return", "parent_sale_id": s_id, "occurred_at": "2026-11-23T15:05:00Z", "amount_minor": 3000},
+            ],
+        }).status_code == 200
+
+        # Tue 09:00 EST (no explicit /close called -> lazy close must fire!): earlier void at Mon 10:02 EST arrives
+        r = c.post("/v1/batches", headers={"X-Simulated-Now": "2026-11-24T14:00:00Z"}, json={
+            "batch_id": str(uuid.uuid4()), "store_id": "store-p1-b", "terminal_id": "term-1",
+            "events": [{"event_id": v_id, "event_type": "void", "parent_sale_id": s_id, "occurred_at": "2026-11-23T15:02:00Z", "amount_minor": 10000}],
+        })
+        assert r.status_code == 200 and r.json()["accepted"] == 1
+
+        mon = c.get("/v1/stores/store-p1-b/totals?day=2026-11-23").json()
+        tue = c.get("/v1/stores/store-p1-b/totals?day=2026-11-24").json()
+        assert mon["business_day"]["status"] == "CLOSED" and mon["totals"]["net_total_minor"] == 7000, mon
+        assert tue["totals"]["adjustments_net_minor"] == -7000 and tue["totals"]["net_total_minor"] == -7000, tue
+
+
+@pytest.mark.asyncio
+async def test_50_rps_atomic_batch_read_isolation():
+    """Sustain >=50 RPS concurrent REPEATABLE READ totals queries for >=1.5s while paired zero-net batches
+    [sale(+1000), return(-1000)] ingest concurrently; assert ZERO partial-batch observations (net == 0 always)."""
+    now_ts = "2026-11-26T16:00:00Z"
+    stop = asyncio.Event()
+    read_count = 0
+    partial_observations = 0
+    t0 = asyncio.get_running_loop().time()
+
+    async with httpx.AsyncClient(base_url=BASE, timeout=20.0) as ac:
+        async def reader_worker():
+            nonlocal read_count, partial_observations
+            while not stop.is_set():
+                resp = await ac.get("/v1/stores/store-p1-50rps/totals?day=2026-11-26")
+                assert resp.status_code == 200
+                net = resp.json()["totals"]["net_total_minor"]
+                read_count += 1
+                if net != 0:
+                    partial_observations += 1
+
+        async def writer_worker():
+            while (asyncio.get_running_loop().time() - t0) < 1.5:
+                s_id = str(uuid.uuid4())
+                r_id = str(uuid.uuid4())
+                resp = await ac.post("/v1/batches", headers={"X-Simulated-Now": now_ts}, json={
+                    "batch_id": str(uuid.uuid4()), "store_id": "store-p1-50rps", "terminal_id": "term-1",
+                    "events": [
+                        {"event_id": s_id, "event_type": "sale", "occurred_at": "2026-11-26T15:00:00Z", "amount_minor": 1000},
+                        {"event_id": r_id, "event_type": "return", "parent_sale_id": s_id, "occurred_at": "2026-11-26T15:01:00Z", "amount_minor": 1000},
+                    ],
+                })
+                assert resp.status_code == 200 and resp.json()["accepted"] == 2
+            stop.set()
+
+        readers = [asyncio.create_task(reader_worker()) for _ in range(8)]
+        await writer_worker()
+        await asyncio.gather(*readers)
+        elapsed = asyncio.get_running_loop().time() - t0
+        rps = read_count / elapsed
+
+        assert rps >= 50.0, f"expected >=50 RPS sustained reads, got {rps:.1f} RPS ({read_count} reads in {elapsed:.2f}s)"
+        assert partial_observations == 0, f"saw {partial_observations} partial batch reads!"

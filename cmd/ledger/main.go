@@ -92,34 +92,7 @@ func main() {
 		AdminRebuild:         ledger.NotImplementedHandler("POST /v1/admin/rebuild"),
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		if err := pools.App.Ping(r.Context()); err != nil {
-			ledger.WriteError(w, http.StatusServiceUnavailable, "DB_UNAVAILABLE", err.Error())
-			return
-		}
-		ledger.WriteJSON(w, http.StatusOK, map[string]any{
-			"status":     "ok",
-			"replica_id": cfg.ReplicaID,
-		})
-	})
-
-	// Person 1 routes
-	mux.HandleFunc("POST /v1/batches", handlers.IngestBatch)
-	mux.HandleFunc("POST /v1/stores/{id}/days/{day}/close", handlers.CloseDay)
-	mux.HandleFunc("GET /v1/stores/{id}/totals", handlers.GetStoreTotal)
-
-	// Person 2 routes
-	mux.HandleFunc("POST /v1/giftcards/redeem", handlers.OnlineGiftCardRedeem)
-	mux.HandleFunc("GET /v1/giftcards/{id}", handlers.GetGiftCard)
-	mux.HandleFunc("POST /v1/loyalty/burn", handlers.OnlineLoyaltyBurn)
-	mux.HandleFunc("GET /v1/loyalty/{id}", handlers.GetLoyalty)
-	mux.HandleFunc("POST /v1/stores/{id}/terminals/{tid}/sync", handlers.TerminalSync)
-	mux.HandleFunc("POST /v1/stores/{id}/terminals/{tid}/fence", handlers.TerminalFence)
-	mux.HandleFunc("GET /v1/ledger/checksum", handlers.GetChecksum)
-	mux.HandleFunc("POST /v1/admin/seed", handlers.AdminSeed)
-	mux.HandleFunc("POST /v1/admin/snapshots", handlers.AdminSnapshot)
-	mux.HandleFunc("POST /v1/admin/rebuild", handlers.AdminRebuild)
+	mux := NewRouter(cfg, pools, handlers)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
