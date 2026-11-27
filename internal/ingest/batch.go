@@ -531,8 +531,82 @@ func IngestPreparedEventsInTx(
 	}
 
 	// 3. Canonical entity lock acquisition in global table order:
-	//    sales -> store_business_days -> gift_cards -> loyalty_accounts
+	//    sales -> (recheck ledger_events!) -> store_business_days -> gift_cards -> loyalty_accounts
 	saleIDSet := make(map[uuid.UUID]struct{})
+	for _, ev := range events {
+		if skipEvent[ev.EventID] {
+			continue
+		}
+		if ev.SaleID != nil {
+			saleIDSet[*ev.SaleID] = struct{}{}
+		}
+	}
+
+	sortedSales := make([]uuid.UUID, 0, len(saleIDSet))
+	for id := range saleIDSet {
+		sortedSales = append(sortedSales, id)
+	}
+	sort.Slice(sortedSales, func(i, j int) bool { return sortedSales[i].String() < sortedSales[j].String() })
+	for _, sid := range sortedSales {
+		if _, err := tx.Exec(ctx, `INSERT INTO sales (sale_id, status) VALUES ($1, 'PLACEHOLDER') ON CONFLICT (sale_id) DO NOTHING`, sid); err != nil {
+			return summary, err
+		}
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM sales WHERE sale_id = $1 FOR UPDATE`, sid); err != nil {
+			return summary, err
+		}
+	}
+
+	// Recheck ledger_events AFTER acquiring the serializing sales lock (and Step 2's online_action_receipts lock)
+	// and BEFORE creating/locking store_business_days, so a losing concurrent duplicate arriving on a different
+	// simulated day never creates an otherwise-empty store_business_days row.
+	if len(sortedSales) > 0 {
+		remIDs := make([]uuid.UUID, 0, len(events))
+		for _, ev := range events {
+			if !skipEvent[ev.EventID] {
+				remIDs = append(remIDs, ev.EventID)
+			}
+		}
+		if len(remIDs) > 0 {
+			reRows, err := tx.Query(ctx, `SELECT event_id, payload_hash FROM ledger_events WHERE event_id = ANY($1)`, remIDs)
+			if err != nil {
+				return summary, err
+			}
+			reHashes := make(map[uuid.UUID][]byte)
+			for reRows.Next() {
+				var eid uuid.UUID
+				var ph []byte
+				if err := reRows.Scan(&eid, &ph); err != nil {
+					reRows.Close()
+					return summary, err
+				}
+				reHashes[eid] = ph
+			}
+			if err := reRows.Err(); err != nil {
+				reRows.Close()
+				return summary, err
+			}
+			reRows.Close()
+
+			for _, ev := range events {
+				if skipEvent[ev.EventID] {
+					continue
+				}
+				if existingHash, ok := reHashes[ev.EventID]; ok {
+					if !bytes.Equal(existingHash, ev.PayloadHash) {
+						return summary, &HTTPError{
+							Status:  http.StatusConflict,
+							Code:    "EVENT_ID_PAYLOAD_MISMATCH",
+							Message: fmt.Sprintf("event_id %s already exists with a different payload", ev.EventID),
+						}
+					}
+					skipEvent[ev.EventID] = true
+					summary.Deduplicated++
+				}
+			}
+		}
+	}
+
+	// Build remaining day, card, and loyalty lock sets ONLY for confirmed non-duplicate events.
 	cardIDSet := make(map[string]struct{})
 	acctIDSet := make(map[string]struct{})
 	locCache := make(map[string]*time.Location)
@@ -542,14 +616,13 @@ func IngestPreparedEventsInTx(
 		dayStr  string
 	}
 	dayKeyMap := make(map[string]storeDayKey)
+	remainingActive := 0
 
 	for _, ev := range events {
 		if skipEvent[ev.EventID] {
 			continue
 		}
-		if ev.SaleID != nil {
-			saleIDSet[*ev.SaleID] = struct{}{}
-		}
+		remainingActive++
 		if ev.CardID != nil {
 			cardIDSet[*ev.CardID] = struct{}{}
 		}
@@ -565,27 +638,19 @@ func IngestPreparedEventsInTx(
 			}
 			locCache[ev.StoreID] = loc
 		}
-		origDay := clock.BusinessDay(ev.OccurredAt, loc)
-		origStr := origDay.Format("2006-01-02")
-		dayKeyMap[ev.StoreID+"|"+origStr] = storeDayKey{storeID: ev.StoreID, day: origDay, dayStr: origStr}
+		// Only financial/tender events touch store_business_days / store_day_totals.
+		if ev.EventType == "sale" || ev.EventType == "return" || ev.EventType == "void" || ev.EventType == "giftcard_redeem" {
+			origDay := clock.BusinessDay(ev.OccurredAt, loc)
+			origStr := origDay.Format("2006-01-02")
+			dayKeyMap[ev.StoreID+"|"+origStr] = storeDayKey{storeID: ev.StoreID, day: origDay, dayStr: origStr}
 
-		currDay := clock.BusinessDay(ingestNow, loc)
-		currStr := currDay.Format("2006-01-02")
-		dayKeyMap[ev.StoreID+"|"+currStr] = storeDayKey{storeID: ev.StoreID, day: currDay, dayStr: currStr}
-	}
-
-	sortedSales := make([]uuid.UUID, 0, len(saleIDSet))
-	for id := range saleIDSet {
-		sortedSales = append(sortedSales, id)
-	}
-	sort.Slice(sortedSales, func(i, j int) bool { return sortedSales[i].String() < sortedSales[j].String() })
-	for _, sid := range sortedSales {
-		if _, err := tx.Exec(ctx, `INSERT INTO sales (sale_id, status) VALUES ($1, 'PLACEHOLDER') ON CONFLICT (sale_id) DO NOTHING`, sid); err != nil {
-			return summary, err
+			currDay := clock.BusinessDay(ingestNow, loc)
+			currStr := currDay.Format("2006-01-02")
+			dayKeyMap[ev.StoreID+"|"+currStr] = storeDayKey{storeID: ev.StoreID, day: currDay, dayStr: currStr}
 		}
-		if _, err := tx.Exec(ctx, `SELECT 1 FROM sales WHERE sale_id = $1 FOR UPDATE`, sid); err != nil {
-			return summary, err
-		}
+	}
+	if remainingActive == 0 {
+		return summary, nil
 	}
 
 	// Pre-lock store_business_days in sorted (store_id, business_day) order before gift_cards/loyalty_accounts
