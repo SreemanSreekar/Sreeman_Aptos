@@ -323,12 +323,6 @@ func PrepareOfflineEvents(
 		if pe.Points != nil {
 			payloadObj["points"] = *pe.Points
 		}
-		if pe.EpochGen != nil {
-			payloadObj["epoch_gen"] = *pe.EpochGen
-		}
-		if pe.TerminalEpochSeq != nil {
-			payloadObj["terminal_epoch_seq"] = *pe.TerminalEpochSeq
-		}
 
 		canonPayload, err := canonical.CanonicalJSON(payloadObj)
 		if err != nil {
@@ -653,7 +647,10 @@ func IngestPreparedEventsInTx(
 		return summary, nil
 	}
 
-	// Pre-lock store_business_days in sorted (store_id, business_day) order before gift_cards/loyalty_accounts
+	// Pre-lock already-existing store_business_days rows in sorted (store_id, business_day) order
+	// before gift_cards/loyalty_accounts. New OPEN rows are created lazily by ResolvePostingDay
+	// only when an event is actually APPLIED, so REJECTED_INVALID/PARKED events and unused
+	// current-day pre-locks never create empty day rows that diverge on full rebuild.
 	sortedDays := make([]storeDayKey, 0, len(dayKeyMap))
 	for _, dk := range dayKeyMap {
 		sortedDays = append(sortedDays, dk)
@@ -665,7 +662,15 @@ func IngestPreparedEventsInTx(
 		return sortedDays[i].dayStr < sortedDays[j].dayStr
 	})
 	for _, dk := range sortedDays {
-		if _, _, err := days.EnsureOpenDayRow(ctx, tx, dk.storeID, locCache[dk.storeID], dk.day); err != nil {
+		var locked int
+		err := tx.QueryRow(ctx, `
+			SELECT 1
+			FROM store_business_days
+			WHERE store_id = $1 AND business_day = $2
+			FOR UPDATE`,
+			dk.storeID, dk.day,
+		).Scan(&locked)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return summary, err
 		}
 	}

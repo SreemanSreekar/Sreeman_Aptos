@@ -11,15 +11,20 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/SreemanSreekar/Sreeman_Aptos/internal/admin"
+	"github.com/SreemanSreekar/Sreeman_Aptos/internal/checksum"
 	"github.com/SreemanSreekar/Sreeman_Aptos/internal/config"
 	"github.com/SreemanSreekar/Sreeman_Aptos/internal/days"
 	"github.com/SreemanSreekar/Sreeman_Aptos/internal/db"
+	"github.com/SreemanSreekar/Sreeman_Aptos/internal/epochs"
+	"github.com/SreemanSreekar/Sreeman_Aptos/internal/giftcards"
 	"github.com/SreemanSreekar/Sreeman_Aptos/internal/ingest"
 	"github.com/SreemanSreekar/Sreeman_Aptos/internal/ledger"
+	"github.com/SreemanSreekar/Sreeman_Aptos/internal/loyalty"
 	"github.com/SreemanSreekar/Sreeman_Aptos/internal/sales"
 )
 
-// compositeProjector wires Person 1's sales & day_close projectors with Person 2's giftcard & loyalty hooks.
+// compositeProjector dispatches event-by-event projections across all event domains.
 type compositeProjector struct{}
 
 func (compositeProjector) ProjectSaleEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) error {
@@ -30,21 +35,12 @@ func (compositeProjector) ProjectDayCloseEvent(ctx context.Context, tx pgx.Tx, e
 	return days.ProjectDayCloseEvent(ctx, tx, e)
 }
 
-// Person 2 replaces these two stub methods with internal/giftcards and internal/loyalty projectors on merge.
 func (compositeProjector) ProjectGiftCardEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) error {
-	_, err := tx.Exec(ctx, `
-		INSERT INTO event_application_status (event_id, status, applied_amount_minor)
-		VALUES ($1, 'APPLIED', 0)
-		ON CONFLICT (event_id) DO NOTHING`, e.EventID)
-	return err
+	return giftcards.ProjectGiftCardEvent(ctx, tx, e)
 }
 
 func (compositeProjector) ProjectLoyaltyEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) error {
-	_, err := tx.Exec(ctx, `
-		INSERT INTO event_application_status (event_id, status, applied_amount_minor)
-		VALUES ($1, 'APPLIED', 0)
-		ON CONFLICT (event_id) DO NOTHING`, e.EventID)
-	return err
+	return loyalty.ProjectLoyaltyEvent(ctx, tx, e)
 }
 
 func main() {
@@ -72,24 +68,26 @@ func main() {
 	proj := compositeProjector{}
 	daysHandler := &days.Handler{Cfg: cfg, Pools: pools}
 	ingestHandler := &ingest.Handler{Cfg: cfg, Pools: pools, Projector: proj}
+	giftcardsHandler := &giftcards.Handler{Cfg: cfg, Pools: pools}
+	loyaltyHandler := &loyalty.Handler{Cfg: cfg, Pools: pools}
+	epochsHandler := &epochs.Handler{Cfg: cfg, Pools: pools, Projector: proj}
+	checksumHandler := &checksum.Handler{Pools: pools}
+	adminHandler := &admin.Handler{Cfg: cfg, Pools: pools, Projector: proj}
 
 	handlers := ledger.RouteHandlers{
-		// Person 1 (live)
-		IngestBatch:   ingestHandler.IngestBatch,
-		CloseDay:      daysHandler.CloseDay,
-		GetStoreTotal: daysHandler.GetStoreTotals,
-
-		// Person 2 (wired on merge of branch 2)
-		OnlineGiftCardRedeem: ledger.NotImplementedHandler("POST /v1/giftcards/redeem"),
-		GetGiftCard:          ledger.NotImplementedHandler("GET /v1/giftcards/{id}"),
-		OnlineLoyaltyBurn:    ledger.NotImplementedHandler("POST /v1/loyalty/burn"),
-		GetLoyalty:           ledger.NotImplementedHandler("GET /v1/loyalty/{id}"),
-		TerminalSync:         ledger.NotImplementedHandler("POST /v1/stores/{id}/terminals/{tid}/sync"),
-		TerminalFence:        ledger.NotImplementedHandler("POST /v1/stores/{id}/terminals/{tid}/fence"),
-		GetChecksum:          ledger.NotImplementedHandler("GET /v1/ledger/checksum"),
-		AdminSeed:            ledger.NotImplementedHandler("POST /v1/admin/seed"),
-		AdminSnapshot:        ledger.NotImplementedHandler("POST /v1/admin/snapshots"),
-		AdminRebuild:         ledger.NotImplementedHandler("POST /v1/admin/rebuild"),
+		IngestBatch:          ingestHandler.IngestBatch,
+		CloseDay:             daysHandler.CloseDay,
+		GetStoreTotal:        daysHandler.GetStoreTotals,
+		OnlineGiftCardRedeem: giftcardsHandler.OnlineRedeem,
+		GetGiftCard:          giftcardsHandler.GetGiftCard,
+		OnlineLoyaltyBurn:    loyaltyHandler.OnlineBurn,
+		GetLoyalty:           loyaltyHandler.GetLoyalty,
+		TerminalSync:         epochsHandler.TerminalSync,
+		TerminalFence:        epochsHandler.TerminalFence,
+		GetChecksum:          checksumHandler.GetChecksum,
+		AdminSeed:            adminHandler.Seed,
+		AdminSnapshot:        adminHandler.CaptureSnapshot,
+		AdminRebuild:         adminHandler.Rebuild,
 	}
 
 	mux := NewRouter(cfg, pools, handlers)
