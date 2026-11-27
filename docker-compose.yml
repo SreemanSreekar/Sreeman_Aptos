@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ledger-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres_dev_password}"
+      POSTGRES_DB: ledger
+      LEDGER_APP_PASSWORD: "${LEDGER_APP_PASSWORD:-ledger_app_dev_pw}"
+      LEDGER_ADMIN_PASSWORD: "${LEDGER_ADMIN_PASSWORD:-ledger_admin_dev_pw}"
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations/000_roles.sh:/docker-entrypoint-initdb.d/000_roles.sh:ro
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ledger"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  api-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ledger-api-1
+    environment:
+      PORT: "8080"
+      REPLICA_ID: "api-1"
+      DATABASE_URL: "postgres://ledger_app:${LEDGER_APP_PASSWORD:-ledger_app_dev_pw}@postgres:5432/ledger?sslmode=disable"
+      ADMIN_DATABASE_URL: "postgres://ledger_admin:${LEDGER_ADMIN_PASSWORD:-ledger_admin_dev_pw}@postgres:5432/ledger?sslmode=disable"
+      ALLOW_SIMULATED_CLOCK: "${ALLOW_SIMULATED_CLOCK:-false}"
+      MAX_FUTURE_SKEW_SECONDS: "300"
+      MAX_EVENT_LATENESS_HOURS: "48"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  api-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ledger-api-2
+    environment:
+      PORT: "8080"
+      REPLICA_ID: "api-2"
+      DATABASE_URL: "postgres://ledger_app:${LEDGER_APP_PASSWORD:-ledger_app_dev_pw}@postgres:5432/ledger?sslmode=disable"
+      ADMIN_DATABASE_URL: "postgres://ledger_admin:${LEDGER_ADMIN_PASSWORD:-ledger_admin_dev_pw}@postgres:5432/ledger?sslmode=disable"
+      ALLOW_SIMULATED_CLOCK: "${ALLOW_SIMULATED_CLOCK:-false}"
+      MAX_FUTURE_SKEW_SECONDS: "300"
+      MAX_EVENT_LATENESS_HOURS: "48"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: ledger-nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api-1:
+        condition: service_healthy
+      api-2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+volumes:
+  pgdata:
