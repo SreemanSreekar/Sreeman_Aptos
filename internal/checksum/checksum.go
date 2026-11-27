@@ -135,6 +135,10 @@ func computeEconomicSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 			giftcard_redeem_minor,
 			(sales_minor - returns_minor - voids_minor) AS net_sales_minor
 		FROM combined
+		WHERE sales_minor <> 0
+		   OR returns_minor <> 0
+		   OR voids_minor <> 0
+		   OR giftcard_redeem_minor <> 0
 		ORDER BY store_id ASC, origin_business_day ASC`)
 	if err != nil {
 		return "", err

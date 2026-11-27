@@ -127,6 +127,16 @@ func ProjectLoyaltyEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) e
 		return err
 	}
 
+	_, err := recomputeLoyaltyState(ctx, tx, accountID, e.AppliedOrder)
+	return err
+}
+
+func recomputeLoyaltyState(
+	ctx context.Context,
+	tx pgx.Tx,
+	accountID string,
+	appliedOrder int64,
+) (int64, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT le.event_id, le.event_type, le.points
 		FROM ledger_events le
@@ -136,30 +146,30 @@ func ProjectLoyaltyEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) e
 		  AND le.event_type IN ('loyalty_earn', 'loyalty_burn')
 		  AND eas.status = 'APPLIED'
 		ORDER BY le.occurred_at ASC, le.event_id ASC`,
-		accountID, e.AppliedOrder,
+		accountID, appliedOrder,
 	)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var prefix []PrefixLoyaltyEvent
 	for rows.Next() {
 		var ev PrefixLoyaltyEvent
 		if err := rows.Scan(&ev.EventID, &ev.EventType, &ev.Points); err != nil {
 			rows.Close()
-			return err
+			return 0, err
 		}
 		prefix = append(prefix, ev)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return err
+		return 0, err
 	}
 	rows.Close()
 
 	earned, burned, balance, status, flags := EvaluateLoyaltyPrefix(accountID, prefix)
 
 	if _, err := tx.Exec(ctx, `DELETE FROM loyalty_negative_flags WHERE account_id = $1`, accountID); err != nil {
-		return err
+		return 0, err
 	}
 	for _, f := range flags {
 		if _, err := tx.Exec(ctx, `
@@ -167,7 +177,7 @@ func ProjectLoyaltyEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) e
 			VALUES ($1, $2, $3, $4)`,
 			f.AccountID, f.TriggerEventID, f.DeficitPoints, f.ResolvedByEventID,
 		); err != nil {
-			return err
+			return 0, err
 		}
 	}
 
@@ -180,10 +190,10 @@ func ProjectLoyaltyEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) e
 		WHERE account_id = $1`,
 		accountID, earned, burned, balance, status,
 	); err != nil {
-		return err
+		return 0, err
 	}
 
-	return nil
+	return balance, nil
 }
 
 func upsertEventStatus(
@@ -340,7 +350,7 @@ func (h *Handler) OnlineBurn(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
-		// Step 2: Canonical lock order: store_business_days -> loyalty_accounts
+		// Step 2: Validate store timezone & lock loyalty_accounts (loyalty does not touch store_business_days)
 		loc, _, err := days.LoadStoreLocation(r.Context(), tx, req.StoreID)
 		if err != nil {
 			abortStatus = http.StatusNotFound
@@ -350,9 +360,6 @@ func (h *Handler) OnlineBurn(w http.ResponseWriter, r *http.Request) {
 		}
 		originDay := clock.BusinessDay(occ, loc)
 		originCutoff := clock.CutoffUTC(originDay, loc)
-		if _, _, err := days.EnsureOpenDayRow(r.Context(), tx, req.StoreID, loc, originDay); err != nil {
-			return err
-		}
 
 		var earnedTotal, burnedTotal, balance int64
 		var accStatus string
@@ -378,7 +385,7 @@ func (h *Handler) OnlineBurn(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Step 3: Attempt atomic insert into ledger_events
-		var insertedID uuid.UUID
+		var appliedOrder int64
 		err = tx.QueryRow(r.Context(), `
 			INSERT INTO ledger_events (
 				event_id, applied_order, event_type, channel,
@@ -392,11 +399,11 @@ func (h *Handler) OnlineBurn(w http.ResponseWriter, r *http.Request) {
 				$9, $10, $11::jsonb, $12
 			)
 			ON CONFLICT (event_id) DO NOTHING
-			RETURNING event_id`,
+			RETURNING applied_order`,
 			eventID, req.StoreID, req.TerminalID, occ, ingestNow,
 			originDay, originCutoff, clock.TZVersion,
 			req.AccountID, req.Points, string(canonPayload), payloadHash,
-		).Scan(&insertedID)
+		).Scan(&appliedOrder)
 
 		// Step 4: Online-vs-batch race branch
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -433,18 +440,12 @@ func (h *Handler) OnlineBurn(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
-		// Winner: apply projection mutations
-		newBurned := burnedTotal + req.Points
-		newBalance := earnedTotal - newBurned
-		if _, err := tx.Exec(r.Context(), `
-			UPDATE loyalty_accounts
-			SET burned_total = $2, balance = $3
-			WHERE account_id = $1`,
-			req.AccountID, newBurned, newBalance,
-		); err != nil {
+		// Winner: apply projection mutations using prefix recomputation so loyalty_negative_flags match rebuild
+		if err := upsertEventStatus(r.Context(), tx, eventID, "APPLIED", nil, req.Points, &req.StoreID, &originDay); err != nil {
 			return err
 		}
-		if err := upsertEventStatus(r.Context(), tx, eventID, "APPLIED", nil, req.Points, &req.StoreID, &originDay); err != nil {
+		newBalance, err := recomputeLoyaltyState(r.Context(), tx, req.AccountID, appliedOrder)
+		if err != nil {
 			return err
 		}
 

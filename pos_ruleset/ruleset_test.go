@@ -107,3 +107,67 @@ func TestCanBurnLoyalty_CapAndUnlimited(t *testing.T) {
 		t.Fatalf("expected unlimited loyalty burn to succeed, got %v", err)
 	}
 }
+
+func TestCanRedeemGiftCard_FailClosedFrozenZeroUnknown(t *testing.T) {
+	g := testGrant()
+	g.Cards["GC-OVERSPENT"] = CardSnapshot{
+		CardID:         "GC-OVERSPENT",
+		BalanceMinor:   -500,
+		Status:         "OVERSPENT_FROZEN",
+		EligibleStores: []string{"S1"},
+	}
+	g.Cards["GC-ADMIN"] = CardSnapshot{
+		CardID:         "GC-ADMIN",
+		BalanceMinor:   2000,
+		Status:         "ADMIN_FROZEN",
+		EligibleStores: []string{"S1"},
+	}
+	g.Cards["GC-ZERO"] = CardSnapshot{
+		CardID:         "GC-ZERO",
+		BalanceMinor:   0,
+		Status:         "ACTIVE",
+		EligibleStores: []string{"S1"},
+	}
+	wall := g.IssuedAtUTC.Add(time.Minute)
+
+	if err := CanRedeemGiftCard(g, "GC-OVERSPENT", 100, "boot-1", 160_000, wall); !errors.Is(err, ErrCardNotActive) {
+		t.Fatalf("expected ErrCardNotActive for OVERSPENT_FROZEN, got %v", err)
+	}
+	if err := CanRedeemGiftCard(g, "GC-ADMIN", 100, "boot-1", 161_000, wall); !errors.Is(err, ErrCardNotActive) {
+		t.Fatalf("expected ErrCardNotActive for ADMIN_FROZEN, got %v", err)
+	}
+	if err := CanRedeemGiftCard(g, "GC-ZERO", 100, "boot-1", 162_000, wall); !errors.Is(err, ErrOfflineCapExceeded) {
+		t.Fatalf("expected ErrOfflineCapExceeded for zero balance, got %v", err)
+	}
+	if err := CanRedeemGiftCard(g, "GC-UNKNOWN", 100, "boot-1", 163_000, wall); !errors.Is(err, ErrCardNotFound) {
+		t.Fatalf("expected ErrCardNotFound for omitted card, got %v", err)
+	}
+}
+
+func TestClockHardening_EmptyBootIDBackwardBoottimeAndDriftTTL(t *testing.T) {
+	// Empty boot_id must fail closed
+	gEmpty := testGrant()
+	gEmpty.BootID = ""
+	wall := gEmpty.IssuedAtUTC.Add(time.Minute)
+	if err := CanRedeemGiftCard(gEmpty, "GC-1", 100, "boot-1", 160_000, wall); !errors.Is(err, ErrBootIDChanged) {
+		t.Fatalf("expected ErrBootIDChanged on empty grant BootID, got %v", err)
+	}
+	if !gEmpty.LocalFenced {
+		t.Fatalf("expected LocalFenced=true when BootID missing")
+	}
+
+	// Backward monotonic boottime must fail closed
+	gBack := testGrant()
+	if err := CanRedeemGiftCard(gBack, "GC-1", 100, "boot-1", gBack.GrantBoottimeMs-1, wall); !errors.Is(err, ErrClockRollback) {
+		t.Fatalf("expected ErrClockRollback on backward boottime, got %v", err)
+	}
+
+	// Drift-tightened TTL boundary (1000 ppm on 6h = 21.6s earlier)
+	gDrift := testGrant()
+	if err := CanRedeemGiftCard(gDrift, "GC-1", 100, "boot-1", gDrift.GrantBoottimeMs+EffectiveBoottimeTTLMs(), wall); !errors.Is(err, ErrOfflineSliceExpired) {
+		t.Fatalf("expected ErrOfflineSliceExpired at drift-tightened TTL boundary, got %v", err)
+	}
+	if err := CanRedeemGiftCard(gDrift, "GC-1", 100, "boot-1", gDrift.GrantBoottimeMs+EffectiveBoottimeTTLMs()-1, wall); err != nil {
+		t.Fatalf("expected redemption 1ms before drift-tightened TTL to succeed, got %v", err)
+	}
+}

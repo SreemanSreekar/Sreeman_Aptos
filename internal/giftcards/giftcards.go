@@ -156,6 +156,19 @@ func ProjectGiftCardEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) 
 		return err
 	}
 
+	adminFrozen := currentStatus == "ADMIN_FROZEN"
+	_, _, err = recomputeGiftCardState(ctx, tx, cardID, e.AppliedOrder, initialBalance, adminFrozen)
+	return err
+}
+
+func recomputeGiftCardState(
+	ctx context.Context,
+	tx pgx.Tx,
+	cardID string,
+	appliedOrder int64,
+	initialBalance int64,
+	adminFrozen bool,
+) (int64, string, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT le.event_id, le.store_id, le.amount_minor
 		FROM ledger_events le
@@ -165,31 +178,30 @@ func ProjectGiftCardEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) 
 		  AND le.event_type = 'giftcard_redeem'
 		  AND eas.status = 'APPLIED'
 		ORDER BY le.occurred_at ASC, le.event_id ASC`,
-		cardID, e.AppliedOrder,
+		cardID, appliedOrder,
 	)
 	if err != nil {
-		return err
+		return 0, "", err
 	}
 	var prefix []PrefixRedeemEvent
 	for rows.Next() {
 		var ev PrefixRedeemEvent
 		if err := rows.Scan(&ev.EventID, &ev.StoreID, &ev.AmountMinor); err != nil {
 			rows.Close()
-			return err
+			return 0, "", err
 		}
 		prefix = append(prefix, ev)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return err
+		return 0, "", err
 	}
 	rows.Close()
 
-	adminFrozen := currentStatus == "ADMIN_FROZEN"
 	newBalance, newStatus, flags := EvaluateGiftCardPrefix(cardID, initialBalance, adminFrozen, prefix)
 
 	if _, err := tx.Exec(ctx, `DELETE FROM giftcard_overspend_flags WHERE card_id = $1`, cardID); err != nil {
-		return err
+		return 0, "", err
 	}
 	for _, f := range flags {
 		if _, err := tx.Exec(ctx, `
@@ -197,7 +209,7 @@ func ProjectGiftCardEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) 
 			VALUES ($1, $2, $3, $4, $5)`,
 			f.CardID, f.EventID, f.StoreID, f.BalanceAfterMinor, f.OverspendDeltaMinor,
 		); err != nil {
-			return err
+			return 0, "", err
 		}
 	}
 
@@ -207,10 +219,10 @@ func ProjectGiftCardEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) 
 		WHERE card_id = $1`,
 		cardID, newBalance, newStatus,
 	); err != nil {
-		return err
+		return 0, "", err
 	}
 
-	return nil
+	return newBalance, newStatus, nil
 }
 
 func upsertEventStatus(
@@ -369,6 +381,8 @@ func (h *Handler) OnlineRedeem(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Step 2: Canonical lock order: store_business_days -> gift_cards
+		// Use a savepoint around ResolvePostingDay so declined online redeems never leave behind
+		// an empty store_business_days / store_day_totals row that diverges on full rebuild.
 		loc, _, err := days.LoadStoreLocation(r.Context(), tx, req.StoreID)
 		if err != nil {
 			abortStatus = http.StatusNotFound
@@ -378,21 +392,28 @@ func (h *Handler) OnlineRedeem(w http.ResponseWriter, r *http.Request) {
 		}
 		originDay := clock.BusinessDay(occ, loc)
 		originCutoff := clock.CutoffUTC(originDay, loc)
+
+		if _, err := tx.Exec(r.Context(), `SAVEPOINT sp_online_redeem_day`); err != nil {
+			return err
+		}
 		postingDay, isAdj, err := days.ResolvePostingDay(r.Context(), tx, req.StoreID, loc, originDay, ingestNow)
 		if err != nil {
 			return err
 		}
 
-		var balanceMinor int64
+		var initialBalance, balanceMinor int64
 		var cardStatus string
 		err = tx.QueryRow(r.Context(), `
-			SELECT balance_minor, status
+			SELECT initial_balance_minor, balance_minor, status
 			FROM gift_cards
 			WHERE card_id = $1
 			FOR UPDATE`,
 			req.CardID,
-		).Scan(&balanceMinor, &cardStatus)
+		).Scan(&initialBalance, &balanceMinor, &cardStatus)
 		if errors.Is(err, pgx.ErrNoRows) {
+			if _, rbErr := tx.Exec(r.Context(), `ROLLBACK TO SAVEPOINT sp_online_redeem_day`); rbErr != nil {
+				return rbErr
+			}
 			return finalizeDeclined(r.Context(), tx, eventID, http.StatusNotFound, "CARD_NOT_FOUND", "gift card not found", &respStatus, &respBody)
 		}
 		if err != nil {
@@ -400,14 +421,20 @@ func (h *Handler) OnlineRedeem(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if cardStatus != "ACTIVE" {
+			if _, rbErr := tx.Exec(r.Context(), `ROLLBACK TO SAVEPOINT sp_online_redeem_day`); rbErr != nil {
+				return rbErr
+			}
 			return finalizeDeclined(r.Context(), tx, eventID, http.StatusConflict, "CARD_FROZEN", fmt.Sprintf("gift card is %s", cardStatus), &respStatus, &respBody)
 		}
 		if balanceMinor < req.AmountMinor {
+			if _, rbErr := tx.Exec(r.Context(), `ROLLBACK TO SAVEPOINT sp_online_redeem_day`); rbErr != nil {
+				return rbErr
+			}
 			return finalizeDeclined(r.Context(), tx, eventID, http.StatusConflict, "INSUFFICIENT_FUNDS", "insufficient gift card balance", &respStatus, &respBody)
 		}
 
 		// Step 3: Attempt atomic insert into ledger_events with ON CONFLICT RETURNING
-		var insertedID uuid.UUID
+		var appliedOrder int64
 		err = tx.QueryRow(r.Context(), `
 			INSERT INTO ledger_events (
 				event_id, applied_order, event_type, channel,
@@ -421,14 +448,17 @@ func (h *Handler) OnlineRedeem(w http.ResponseWriter, r *http.Request) {
 				$9, $10, $11::jsonb, $12
 			)
 			ON CONFLICT (event_id) DO NOTHING
-			RETURNING event_id`,
+			RETURNING applied_order`,
 			eventID, req.StoreID, req.TerminalID, occ, ingestNow,
 			originDay, originCutoff, clock.TZVersion,
 			req.CardID, req.AmountMinor, string(canonPayload), payloadHash,
-		).Scan(&insertedID)
+		).Scan(&appliedOrder)
 
 		// Step 4: Online-vs-batch race branch
 		if errors.Is(err, pgx.ErrNoRows) {
+			if _, rbErr := tx.Exec(r.Context(), `ROLLBACK TO SAVEPOINT sp_online_redeem_day`); rbErr != nil {
+				return rbErr
+			}
 			var existingHash []byte
 			if err := tx.QueryRow(r.Context(), `SELECT payload_hash FROM ledger_events WHERE event_id = $1`, eventID).Scan(&existingHash); err != nil {
 				return err
@@ -462,14 +492,11 @@ func (h *Handler) OnlineRedeem(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
-		// Winner: apply projection mutations
-		newBalance := balanceMinor - req.AmountMinor
-		if _, err := tx.Exec(r.Context(), `
-			UPDATE gift_cards SET balance_minor = $2 WHERE card_id = $1`,
-			req.CardID, newBalance,
-		); err != nil {
+		if _, err := tx.Exec(r.Context(), `RELEASE SAVEPOINT sp_online_redeem_day`); err != nil {
 			return err
 		}
+
+		// Winner: apply projection mutations using the exact same prefix recomputation as rebuild
 		if err := upsertEventStatus(r.Context(), tx, eventID, "APPLIED", nil, req.AmountMinor, &req.StoreID, &postingDay, isAdj); err != nil {
 			return err
 		}
@@ -478,6 +505,10 @@ func (h *Handler) OnlineRedeem(w http.ResponseWriter, r *http.Request) {
 			entryKind = "LATE_POSTING"
 		}
 		if err := days.ApplyTotalsDelta(r.Context(), tx, req.StoreID, postingDay, originDay, eventID, eventID, "giftcard_redeem", entryKind, 0, req.AmountMinor, isAdj); err != nil {
+			return err
+		}
+		newBalance, _, err := recomputeGiftCardState(r.Context(), tx, req.CardID, appliedOrder, initialBalance, false)
+		if err != nil {
 			return err
 		}
 

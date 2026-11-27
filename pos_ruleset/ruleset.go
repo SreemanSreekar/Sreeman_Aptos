@@ -24,11 +24,18 @@ var (
 	ErrBootIDChanged            = errors.New("OFFLINE_REBOOT_FENCED")
 	ErrClockRollback            = errors.New("CLOCK_ROLLBACK_DETECTED")
 	ErrOfflineSliceExpired      = errors.New("OFFLINE_SLICE_EXPIRED")
-	ErrOfflineStoreNotEligible  = errors.New("OFFLINE_STORE_NOT_ELIGIBLE")
-	ErrCardNotActive            = errors.New("CARD_NOT_ACTIVE")
-	ErrOfflineCapExceeded       = errors.New("OFFLINE_CAP_EXCEEDED")
+	ErrOfflineStoreNotEligible   = errors.New("OFFLINE_STORE_NOT_ELIGIBLE")
+	ErrCardNotFound              = errors.New("CARD_NOT_FOUND")
+	ErrCardNotActive             = errors.New("CARD_NOT_ACTIVE")
+	ErrOfflineCapExceeded        = errors.New("OFFLINE_CAP_EXCEEDED")
 	ErrOfflineLoyaltyCapExceeded = errors.New("OFFLINE_LOYALTY_CAP_EXCEEDED")
 )
+
+// EffectiveBoottimeTTLMs returns the offline slice TTL conservatively tightened
+// by DefaultMaxDriftPPM (1000 ppm = 0.1%) to account for hardware oscillator drift.
+func EffectiveBoottimeTTLMs() int64 {
+	return OfflineSliceTTLMs - (OfflineSliceTTLMs*DefaultMaxDriftPPM)/1_000_000
+}
 
 // CardSnapshot holds the last-known ACTIVE card state delivered to the terminal at sync.
 type CardSnapshot struct {
@@ -56,19 +63,22 @@ type LocalSliceGrant struct {
 	Cards                    map[string]CardSnapshot `json:"cards,omitempty"`
 }
 
-// checkLocalTimeAndFence enforces all four fail-closed local clock and reboot guards.
+// checkLocalTimeAndFence enforces all fail-closed local clock, drift, and reboot guards.
 func checkLocalTimeAndFence(grant *LocalSliceGrant, currentBootID string, currentBoottimeMs int64, currentWallUTC time.Time) error {
 	if grant.LocalFenced {
 		return ErrTerminalLocalFenced
 	}
-	if grant.BootID != "" && currentBootID != grant.BootID {
+	if grant.BootID == "" || currentBootID == "" || currentBootID != grant.BootID {
 		grant.LocalFenced = true
 		return ErrBootIDChanged
 	}
 	if !grant.HWMUTC.IsZero() && currentWallUTC.Before(grant.HWMUTC) {
 		return ErrClockRollback
 	}
-	if currentBoottimeMs-grant.GrantBoottimeMs >= OfflineSliceTTLMs {
+	if currentBoottimeMs < grant.GrantBoottimeMs {
+		return ErrClockRollback
+	}
+	if currentBoottimeMs-grant.GrantBoottimeMs >= EffectiveBoottimeTTLMs() {
 		return ErrOfflineSliceExpired
 	}
 	if !grant.SliceExpiresAtUTC.IsZero() && !currentWallUTC.Before(grant.SliceExpiresAtUTC) {
@@ -97,24 +107,30 @@ func CanRedeemGiftCard(
 		return err
 	}
 
+	card, ok := grant.Cards[cardID]
+	if !ok {
+		return ErrCardNotFound
+	}
+	if card.Status != "ACTIVE" {
+		return ErrCardNotActive
+	}
+	eligible := false
+	for _, s := range card.EligibleStores {
+		if s == grant.StoreID {
+			eligible = true
+			break
+		}
+	}
+	if !eligible {
+		return ErrOfflineStoreNotEligible
+	}
+
 	limit := grant.SliceMinor
-	if card, ok := grant.Cards[cardID]; ok {
-		if card.Status != "ACTIVE" {
-			return ErrCardNotActive
-		}
-		eligible := false
-		for _, s := range card.EligibleStores {
-			if s == grant.StoreID {
-				eligible = true
-				break
-			}
-		}
-		if !eligible {
-			return ErrOfflineStoreNotEligible
-		}
-		if card.BalanceMinor < limit {
-			limit = card.BalanceMinor
-		}
+	if card.BalanceMinor < limit {
+		limit = card.BalanceMinor
+	}
+	if limit <= 0 {
+		return ErrOfflineCapExceeded
 	}
 
 	if grant.SpentByCardMinor == nil {
