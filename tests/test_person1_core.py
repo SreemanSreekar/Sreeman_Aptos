@@ -276,24 +276,55 @@ async def test_50_rps_atomic_batch_read_isolation():
                     partial_observations += 1
 
         async def writer_worker():
-            while (asyncio.get_running_loop().time() - t0) < 1.5:
-                s_id = str(uuid.uuid4())
-                r_id = str(uuid.uuid4())
-                resp = await ac.post("/v1/batches", headers={"X-Simulated-Now": now_ts}, json={
-                    "batch_id": str(uuid.uuid4()), "store_id": "store-p1-50rps", "terminal_id": "term-1",
-                    "events": [
-                        {"event_id": s_id, "event_type": "sale", "occurred_at": "2026-11-26T15:00:00Z", "amount_minor": 1000},
-                        {"event_id": r_id, "event_type": "return", "parent_sale_id": s_id, "occurred_at": "2026-11-26T15:01:00Z", "amount_minor": 1000},
-                    ],
-                })
-                assert resp.status_code == 200 and resp.json()["accepted"] == 2
-            stop.set()
+            try:
+                while (asyncio.get_running_loop().time() - t0) < 1.5:
+                    s_id = str(uuid.uuid4())
+                    r_id = str(uuid.uuid4())
+                    resp = await ac.post("/v1/batches", headers={"X-Simulated-Now": now_ts}, json={
+                        "batch_id": str(uuid.uuid4()), "store_id": "store-p1-50rps", "terminal_id": "term-1",
+                        "events": [
+                            {"event_id": s_id, "event_type": "sale", "occurred_at": "2026-11-26T15:00:00Z", "amount_minor": 1000},
+                            {"event_id": r_id, "event_type": "return", "parent_sale_id": s_id, "occurred_at": "2026-11-26T15:01:00Z", "amount_minor": 1000},
+                        ],
+                    })
+                    assert resp.status_code == 200 and resp.json()["accepted"] == 2
+            finally:
+                stop.set()
 
         readers = [asyncio.create_task(reader_worker()) for _ in range(8)]
-        await writer_worker()
-        await asyncio.gather(*readers)
+        try:
+            await writer_worker()
+        finally:
+            stop.set()
+            await asyncio.gather(*readers, return_exceptions=True)
         elapsed = asyncio.get_running_loop().time() - t0
         rps = read_count / elapsed
 
         assert rps >= 50.0, f"expected >=50 RPS sustained reads, got {rps:.1f} RPS ({read_count} reads in {elapsed:.2f}s)"
         assert partial_observations == 0, f"saw {partial_observations} partial batch reads!"
+
+
+def test_idempotent_retry_on_new_day_creates_no_business_day_row():
+    """Retrying an already-ingested event on a later day with no store_business_days row must be a
+    true no-op and MUST NOT create an empty OPEN store_business_days row for the retry day."""
+    ev_id = str(uuid.uuid4())
+    with httpx.Client(base_url=BASE, timeout=15.0) as c:
+        # Initial ingest on 2026-11-21 (Saturday)
+        r1 = c.post("/v1/batches", headers={"X-Simulated-Now": "2026-11-21T15:00:00Z"}, json={
+            "batch_id": str(uuid.uuid4()), "store_id": "store-p1-b", "terminal_id": "term-1",
+            "events": [{"event_id": ev_id, "event_type": "sale", "occurred_at": "2026-11-21T14:55:00Z", "amount_minor": 1234}],
+        })
+        assert r1.status_code == 200 and r1.json()["accepted"] == 1
+
+        # Retry the exact same event on 2026-11-22 (Sunday — which has NO store_business_days row yet)
+        r2 = c.post("/v1/batches", headers={"X-Simulated-Now": "2026-11-22T15:00:00Z"}, json={
+            "batch_id": str(uuid.uuid4()), "store_id": "store-p1-b", "terminal_id": "term-1",
+            "events": [{"event_id": ev_id, "event_type": "sale", "occurred_at": "2026-11-21T14:55:00Z", "amount_minor": 1234}],
+        })
+        assert r2.status_code == 200 and r2.json()["deduplicated"] == 1 and r2.json()["accepted"] == 0
+
+    with psycopg.connect(APP_DSN, autocommit=True) as conn:
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM store_business_days WHERE store_id = 'store-p1-b' AND business_day = '2026-11-22'"
+        ).fetchone()[0]
+        assert cnt == 0, f"expected 0 store_business_days rows for retry day 2026-11-22, got {cnt}"

@@ -387,6 +387,54 @@ func IngestPreparedEventsInTx(
 		return summary, nil
 	}
 
+	// 0. Pre-check already-committed event_ids in ledger_events so idempotent retries are true no-ops
+	//    and never create empty store_business_days / sales / loyalty_accounts rows on a new day.
+	skipEvent := make(map[uuid.UUID]bool)
+	allIDs := make([]uuid.UUID, len(events))
+	for i, ev := range events {
+		allIDs[i] = ev.EventID
+	}
+	existingHashes := make(map[uuid.UUID][]byte)
+	preRows, err := tx.Query(ctx, `SELECT event_id, payload_hash FROM ledger_events WHERE event_id = ANY($1)`, allIDs)
+	if err != nil {
+		return summary, err
+	}
+	for preRows.Next() {
+		var eid uuid.UUID
+		var ph []byte
+		if err := preRows.Scan(&eid, &ph); err != nil {
+			preRows.Close()
+			return summary, err
+		}
+		existingHashes[eid] = ph
+	}
+	if err := preRows.Err(); err != nil {
+		preRows.Close()
+		return summary, err
+	}
+	preRows.Close()
+
+	activeCount := 0
+	for _, ev := range events {
+		if existingHash, ok := existingHashes[ev.EventID]; ok {
+			if !bytes.Equal(existingHash, ev.PayloadHash) {
+				return summary, &HTTPError{
+					Status:  http.StatusConflict,
+					Code:    "EVENT_ID_PAYLOAD_MISMATCH",
+					Message: fmt.Sprintf("event_id %s already exists with a different payload", ev.EventID),
+				}
+			}
+			skipEvent[ev.EventID] = true
+			summary.Deduplicated++
+			continue
+		}
+		activeCount++
+	}
+	if activeCount == 0 {
+		// All events in this batch are confirmed idempotent duplicates -> true no-op.
+		return summary, nil
+	}
+
 	// 1. Live-ingestion-only slice spendability gate for offline giftcard_redeem & loyalty_burn
 	type sliceKey struct {
 		storeID    string
@@ -395,6 +443,9 @@ func IngestPreparedEventsInTx(
 	}
 	checkedSlices := make(map[sliceKey]bool)
 	for _, ev := range events {
+		if skipEvent[ev.EventID] {
+			continue
+		}
 		if ev.EventType == "giftcard_redeem" || ev.EventType == "loyalty_burn" {
 			sk := sliceKey{ev.StoreID, ev.TerminalID, *ev.EpochGen}
 			if !checkedSlices[sk] {
@@ -427,10 +478,12 @@ func IngestPreparedEventsInTx(
 	}
 
 	// 2. Claim-first online_action_receipts (PENDING) for giftcard_redeem & loyalty_burn in ascending event_id order
-	skipEvent := make(map[uuid.UUID]bool)
 	claimedReceipts := make(map[uuid.UUID]bool)
 	receiptCandidates := make([]preparedEvent, 0)
 	for _, ev := range events {
+		if skipEvent[ev.EventID] {
+			continue
+		}
 		if ev.EventType == "giftcard_redeem" || ev.EventType == "loyalty_burn" {
 			receiptCandidates = append(receiptCandidates, ev)
 		}
