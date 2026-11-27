@@ -1,0 +1,33 @@
+# ============================================================
+# P2 – Offline-first POS Ledger (Aptos Intern Hiring 2027)
+# Python dependencies — harness/ test & load tools only
+# The application server is written in Go (see go.mod).
+# ============================================================
+
+# --- HTTP client used by harness load/invariant scripts ---
+httpx[http2]>=0.27.0          # async + sync HTTP/1.1 & HTTP/2 client
+
+# --- PostgreSQL driver used by harness invariant checker ---
+psycopg[binary,pool]>=3.1.19  # psycopg3; binary wheel for speed; pool for concurrent readers
+
+# --- Async support ---
+anyio>=4.4.0                   # backend for httpx async; works with asyncio
+
+# --- Data generation & hashing ---
+faker>=26.0.0                  # realistic store/terminal/event seed data
+# SHA-256 is in the standard library (hashlib); no extra package needed
+
+# --- Test runner ---
+pytest>=8.2.0                  # test harness runner
+pytest-asyncio>=0.23.0         # async test support
+pytest-xdist>=3.5.0            # parallel test execution (-n auto)
+
+# --- Timing / clock simulation ---
+python-dateutil>=2.9.0         # RFC3339 / timezone arithmetic in harness scripts
+pytz>=2024.1                   # IANA timezone lookups (mirrors tzdata used in Go image)
+
+# --- Invariant / checksum verification ---
+# (SHA-256 checksums computed with hashlib; no extra dep)
+
+# --- Optional: pretty harness output ---
+rich>=13.7.0                   # coloured tables for harness run summaries
