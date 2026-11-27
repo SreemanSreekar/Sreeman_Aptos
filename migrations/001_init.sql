@@ -427,55 +427,69 @@ CREATE TRIGGER store_business_days_immutable_guard
     BEFORE INSERT OR UPDATE OR DELETE ON store_business_days
     FOR EACH ROW EXECUTE FUNCTION trg_store_business_days_immutable();
 
-CREATE OR REPLACE FUNCTION trg_enforce_closed_day_immutable() RETURNS TRIGGER AS $$
+CREATE OR REPLACE FUNCTION trg_enforce_closed_day_totals() RETURNS TRIGGER AS $$
 DECLARE
-    v_state     TEXT;
-    v_old_store TEXT;
-    v_old_day   DATE;
-    v_new_store TEXT;
-    v_new_day   DATE;
+    v_state TEXT;
 BEGIN
     IF TG_OP IN ('UPDATE', 'DELETE') THEN
-        v_old_store := OLD.store_id;
-        v_old_day   := CASE WHEN TG_TABLE_NAME = 'store_day_totals' THEN OLD.business_day ELSE OLD.posting_business_day END;
-
         SELECT status INTO v_state
         FROM store_business_days
-        WHERE store_id = v_old_store AND business_day = v_old_day
+        WHERE store_id = OLD.store_id AND business_day = OLD.business_day
         FOR SHARE;
-
         IF v_state = 'CLOSED' THEN
-            RAISE EXCEPTION 'BUSINESS_DAY_CLOSED_IMMUTABLE: % forbidden on closed day (%, %) in %',
-                TG_OP, v_old_store, v_old_day, TG_TABLE_NAME USING ERRCODE = '22023';
+            RAISE EXCEPTION 'BUSINESS_DAY_CLOSED_IMMUTABLE: % forbidden on closed day (%, %) in store_day_totals',
+                TG_OP, OLD.store_id, OLD.business_day USING ERRCODE = '22023';
         END IF;
     END IF;
-
     IF TG_OP IN ('INSERT', 'UPDATE') THEN
-        v_new_store := NEW.store_id;
-        v_new_day   := CASE WHEN TG_TABLE_NAME = 'store_day_totals' THEN NEW.business_day ELSE NEW.posting_business_day END;
-
         SELECT status INTO v_state
         FROM store_business_days
-        WHERE store_id = v_new_store AND business_day = v_new_day
+        WHERE store_id = NEW.store_id AND business_day = NEW.business_day
         FOR SHARE;
-
         IF v_state = 'CLOSED' THEN
-            RAISE EXCEPTION 'BUSINESS_DAY_CLOSED_IMMUTABLE: % forbidden on closed day (%, %) in %',
-                TG_OP, v_new_store, v_new_day, TG_TABLE_NAME USING ERRCODE = '22023';
+            RAISE EXCEPTION 'BUSINESS_DAY_CLOSED_IMMUTABLE: % forbidden on closed day (%, %) in store_day_totals',
+                TG_OP, NEW.store_id, NEW.business_day USING ERRCODE = '22023';
         END IF;
     END IF;
+    RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION trg_enforce_closed_day_adjustments() RETURNS TRIGGER AS $$
+DECLARE
+    v_state TEXT;
+BEGIN
+    IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        SELECT status INTO v_state
+        FROM store_business_days
+        WHERE store_id = OLD.store_id AND business_day = OLD.posting_business_day
+        FOR SHARE;
+        IF v_state = 'CLOSED' THEN
+            RAISE EXCEPTION 'BUSINESS_DAY_CLOSED_IMMUTABLE: % forbidden on closed day (%, %) in store_day_adjustments',
+                TG_OP, OLD.store_id, OLD.posting_business_day USING ERRCODE = '22023';
+        END IF;
+    END IF;
+    IF TG_OP IN ('INSERT', 'UPDATE') THEN
+        SELECT status INTO v_state
+        FROM store_business_days
+        WHERE store_id = NEW.store_id AND business_day = NEW.posting_business_day
+        FOR SHARE;
+        IF v_state = 'CLOSED' THEN
+            RAISE EXCEPTION 'BUSINESS_DAY_CLOSED_IMMUTABLE: % forbidden on closed day (%, %) in store_day_adjustments',
+                TG_OP, NEW.store_id, NEW.posting_business_day USING ERRCODE = '22023';
+        END IF;
+    END IF;
     RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER store_day_totals_immutable_when_closed
     BEFORE INSERT OR UPDATE OR DELETE ON store_day_totals
-    FOR EACH ROW EXECUTE FUNCTION trg_enforce_closed_day_immutable();
+    FOR EACH ROW EXECUTE FUNCTION trg_enforce_closed_day_totals();
 
 CREATE TRIGGER store_day_adjustments_immutable_when_closed
     BEFORE INSERT OR UPDATE OR DELETE ON store_day_adjustments
-    FOR EACH ROW EXECUTE FUNCTION trg_enforce_closed_day_immutable();
+    FOR EACH ROW EXECUTE FUNCTION trg_enforce_closed_day_adjustments();
 
 -- 7. Operational Tables (Excluded from read_model_sha256 & economic_sha256)
 CREATE TABLE online_action_receipts (
