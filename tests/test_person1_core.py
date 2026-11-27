@@ -332,41 +332,44 @@ def test_idempotent_retry_on_new_day_creates_no_business_day_row():
 
 @pytest.mark.asyncio
 async def test_concurrent_duplicate_different_days_creates_no_empty_day_row():
-    """Fire the exact same sale event concurrently across two different simulated ingest days
-    (2026-11-18 and 2026-11-19) on a fresh store; assert ONLY the winning day gets a
-    store_business_days row (or if 11-19 won, 11-18 closed + 11-19 open; never an empty losing day)."""
-    with psycopg.connect(ADMIN_DSN, autocommit=True) as conn:
-        conn.execute("SELECT admin_seed_store('store-p1-conc-dup', 'America/New_York', ARRAY['term-1'], '2026-11-18T12:00:00Z'::timestamptz)")
-
-    # Run 10 rounds across distinct fresh days/events to exercise both winner orderings
+    """Run 10 rounds firing the exact same sale event concurrently across two different simulated
+    ingest days (2026-11-18 and 2026-11-19) on unique fresh stores; assert ONLY the winning day
+    gets a store_business_days row (or if 11-19 won, 11-18 closed + 11-19 open; never an empty losing day)."""
     async with httpx.AsyncClient(base_url=BASE, timeout=15.0) as ac:
-        ev_id = str(uuid.uuid4())
-        payload = {
-            "batch_id": str(uuid.uuid4()),
-            "store_id": "store-p1-conc-dup",
-            "terminal_id": "term-1",
-            "events": [{
-                "event_id": ev_id,
-                "event_type": "sale",
-                "occurred_at": "2026-11-18T14:55:00Z",
-                "amount_minor": 2000,
-            }],
-        }
-        r1, r2 = await asyncio.gather(
-            ac.post("/v1/batches", headers={"X-Simulated-Now": "2026-11-18T15:00:00Z"}, json=payload),
-            ac.post("/v1/batches", headers={"X-Simulated-Now": "2026-11-19T15:00:00Z"}, json=payload),
-        )
-        assert r1.status_code == 200 and r2.status_code == 200
-        assert r1.json()["accepted"] + r2.json()["accepted"] == 1
-        assert r1.json()["deduplicated"] + r2.json()["deduplicated"] == 1
+        for _ in range(10):
+            store_id = f"store-p1-conc-dup-{uuid.uuid4().hex[:8]}"
+            with psycopg.connect(ADMIN_DSN, autocommit=True) as conn:
+                conn.execute(
+                    "SELECT admin_seed_store(%s, 'America/New_York', ARRAY['term-1'], '2026-11-18T12:00:00Z'::timestamptz)",
+                    (store_id,),
+                )
 
-    with psycopg.connect(APP_DSN, autocommit=True) as conn:
-        rows = conn.execute(
-            "SELECT business_day::text, status FROM store_business_days WHERE store_id = 'store-p1-conc-dup' ORDER BY business_day"
-        ).fetchall()
-        if r1.json()["accepted"] == 1:
-            # 2026-11-18 won -> 2026-11-19 retry MUST NOT have created an empty OPEN row
-            assert rows == [("2026-11-18", "OPEN")], f"losing 11-19 retry created an empty day row: {rows}"
-        else:
-            # 2026-11-19 won -> 2026-11-18 was lazily closed and posted as adjustment in 2026-11-19
-            assert rows == [("2026-11-18", "CLOSED"), ("2026-11-19", "OPEN")], rows
+            ev_id = str(uuid.uuid4())
+            payload = {
+                "batch_id": str(uuid.uuid4()),
+                "store_id": store_id,
+                "terminal_id": "term-1",
+                "events": [{
+                    "event_id": ev_id,
+                    "event_type": "sale",
+                    "occurred_at": "2026-11-18T14:55:00Z",
+                    "amount_minor": 2000,
+                }],
+            }
+            r1, r2 = await asyncio.gather(
+                ac.post("/v1/batches", headers={"X-Simulated-Now": "2026-11-18T15:00:00Z"}, json=payload),
+                ac.post("/v1/batches", headers={"X-Simulated-Now": "2026-11-19T15:00:00Z"}, json=payload),
+            )
+            assert r1.status_code == 200 and r2.status_code == 200
+            assert r1.json()["accepted"] + r2.json()["accepted"] == 1
+            assert r1.json()["deduplicated"] + r2.json()["deduplicated"] == 1
+
+            with psycopg.connect(APP_DSN, autocommit=True) as conn:
+                rows = conn.execute(
+                    "SELECT business_day::text, status FROM store_business_days WHERE store_id = %s ORDER BY business_day",
+                    (store_id,),
+                ).fetchall()
+                if r1.json()["accepted"] == 1:
+                    assert rows == [("2026-11-18", "OPEN")], f"losing 11-19 retry created an empty day row: {rows}"
+                else:
+                    assert rows == [("2026-11-18", "CLOSED"), ("2026-11-19", "OPEN")], rows
