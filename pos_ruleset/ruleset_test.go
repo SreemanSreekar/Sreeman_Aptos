@@ -2,6 +2,7 @@ package pos_ruleset
 
 import (
 	"errors"
+	"math"
 	"testing"
 	"time"
 )
@@ -169,5 +170,46 @@ func TestClockHardening_EmptyBootIDBackwardBoottimeAndDriftTTL(t *testing.T) {
 	}
 	if err := CanRedeemGiftCard(gDrift, "GC-1", 100, "boot-1", gDrift.GrantBoottimeMs+EffectiveBoottimeTTLMs()-1, wall); err != nil {
 		t.Fatalf("expected redemption 1ms before drift-tightened TTL to succeed, got %v", err)
+	}
+}
+
+func TestCapOverflowProtectionAndFiveStoreLimit(t *testing.T) {
+	// 1. Gift-card int64 overflow bypass regression: spent=1 + MaxInt64 must NOT wrap and pass cap
+	g := testGrant()
+	wall := g.IssuedAtUTC.Add(time.Minute)
+	if err := CanRedeemGiftCard(g, "GC-1", 1, "boot-1", 160_000, wall); err != nil {
+		t.Fatalf("initial spend of 1 failed: %v", err)
+	}
+	if err := CanRedeemGiftCard(g, "GC-1", math.MaxInt64, "boot-1", 161_000, wall.Add(time.Second)); !errors.Is(err, ErrOfflineCapExceeded) {
+		t.Fatalf("expected ErrOfflineCapExceeded for MaxInt64 overflow attempt, got %v", err)
+	}
+	if g.SpentByCardMinor["GC-1"] != 1 {
+		t.Fatalf("expected counter unchanged at 1, got %d", g.SpentByCardMinor["GC-1"])
+	}
+
+	// 2. Loyalty int64 overflow bypass regression (capped and unlimited)
+	if err := CanBurnLoyalty(g, "ACC-1", 1, "boot-1", 162_000, wall.Add(2*time.Second)); err != nil {
+		t.Fatalf("initial loyalty burn of 1 failed: %v", err)
+	}
+	if err := CanBurnLoyalty(g, "ACC-1", math.MaxInt64, "boot-1", 163_000, wall.Add(3*time.Second)); !errors.Is(err, ErrOfflineLoyaltyCapExceeded) {
+		t.Fatalf("expected ErrOfflineLoyaltyCapExceeded for capped MaxInt64 overflow, got %v", err)
+	}
+	g.LoyaltySlicePoints = nil // unlimited mode must still reject counter wrap
+	if err := CanBurnLoyalty(g, "ACC-1", math.MaxInt64, "boot-1", 164_000, wall.Add(4*time.Second)); !errors.Is(err, ErrOfflineLoyaltyCapExceeded) {
+		t.Fatalf("expected ErrOfflineLoyaltyCapExceeded for unlimited counter wrap, got %v", err)
+	}
+	if g.TotalLoyaltyBurnedPoints != 1 {
+		t.Fatalf("expected loyalty counter unchanged at 1, got %d", g.TotalLoyaltyBurnedPoints)
+	}
+
+	// 3. Standalone ruleset must reject cards with > 5 eligible stores
+	g.Cards["GC-SIX"] = CardSnapshot{
+		CardID:         "GC-SIX",
+		BalanceMinor:   5000,
+		Status:         "ACTIVE",
+		EligibleStores: []string{"S1", "S2", "S3", "S4", "S5", "S6"},
+	}
+	if err := CanRedeemGiftCard(g, "GC-SIX", 100, "boot-1", 165_000, wall.Add(5*time.Second)); !errors.Is(err, ErrOfflineStoreNotEligible) {
+		t.Fatalf("expected ErrOfflineStoreNotEligible for 6 eligible stores, got %v", err)
 	}
 }

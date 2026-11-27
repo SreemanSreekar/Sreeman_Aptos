@@ -71,6 +71,14 @@ func EvaluateLoyaltyPrefix(accountID string, events []PrefixLoyaltyEvent) (earne
 	return earnedTotal, burnedTotal, balance, status, flags
 }
 
+// ExceedsOfflineLoyaltyCap performs an overflow-safe int64 check for priorBurn + points > capPoints.
+func ExceedsOfflineLoyaltyCap(priorBurn, points, capPoints int64) bool {
+	if points <= 0 || capPoints < 0 || priorBurn < 0 || priorBurn > capPoints {
+		return true
+	}
+	return points > capPoints-priorBurn
+}
+
 // ProjectLoyaltyEvent projects a single loyalty_earn or loyalty_burn event
 // deterministically using prefix-scoped (applied_order <= e.AppliedOrder) recomputation.
 func ProjectLoyaltyEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) error {
@@ -117,7 +125,7 @@ func ProjectLoyaltyEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) e
 			).Scan(&priorBurn); err != nil {
 				return err
 			}
-			if priorBurn+pts > loyaltyCap {
+			if ExceedsOfflineLoyaltyCap(priorBurn, pts, loyaltyCap) {
 				return upsertEventStatus(ctx, tx, e.EventID, "REJECTED_INVALID", ptrStr("OFFLINE_LOYALTY_CAP_EXCEEDED"), 0, nil, nil)
 			}
 		}

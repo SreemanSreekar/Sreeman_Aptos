@@ -66,6 +66,14 @@ func EvaluateGiftCardPrefix(cardID string, initialBalance int64, adminFrozen boo
 	return running, status, flags
 }
 
+// ExceedsOfflineCap performs an overflow-safe int64 check for priorSpend + amount > capMinor.
+func ExceedsOfflineCap(priorSpend, amount, capMinor int64) bool {
+	if amount <= 0 || capMinor < 0 || priorSpend < 0 || priorSpend > capMinor {
+		return true
+	}
+	return amount > capMinor-priorSpend
+}
+
 // ProjectGiftCardEvent projects a single giftcard_redeem event deterministically
 // using prefix-scoped (applied_order <= e.AppliedOrder) canonical recomputation.
 func ProjectGiftCardEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) error {
@@ -130,7 +138,7 @@ func ProjectGiftCardEvent(ctx context.Context, tx pgx.Tx, e ledger.EventRecord) 
 		if err != nil {
 			return err
 		}
-		if priorEpochSpend+amt > capMinor {
+		if ExceedsOfflineCap(priorEpochSpend, amt, capMinor) {
 			return upsertEventStatus(ctx, tx, e.EventID, "REJECTED_INVALID", ptrStr("OFFLINE_CAP_EXCEEDED"), 0, nil, nil, false)
 		}
 	}

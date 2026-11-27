@@ -4,6 +4,8 @@ package pos_ruleset
 
 import (
 	"errors"
+	"fmt"
+	"math"
 	"time"
 )
 
@@ -11,6 +13,9 @@ const (
 	// OfflineSliceTTL is the maximum duration (6 hours) an offline slice grant remains valid.
 	OfflineSliceTTL   = 6 * time.Hour
 	OfflineSliceTTLMs = int64(21_600_000)
+
+	// MaxOfflineEligibleStores is the chain-wide hard bound (K_max = 5) on eligible offline stores per card.
+	MaxOfflineEligibleStores = 5
 
 	// DefaultMaxDriftPPM is the bounded hardware oscillator drift (1000 ppm = 0.1%).
 	DefaultMaxDriftPPM = 1000
@@ -114,6 +119,9 @@ func CanRedeemGiftCard(
 	if card.Status != "ACTIVE" {
 		return ErrCardNotActive
 	}
+	if len(card.EligibleStores) == 0 || len(card.EligibleStores) > MaxOfflineEligibleStores {
+		return fmt.Errorf("%w: eligible_stores count %d outside [1, %d]", ErrOfflineStoreNotEligible, len(card.EligibleStores), MaxOfflineEligibleStores)
+	}
 	eligible := false
 	for _, s := range card.EligibleStores {
 		if s == grant.StoreID {
@@ -136,11 +144,12 @@ func CanRedeemGiftCard(
 	if grant.SpentByCardMinor == nil {
 		grant.SpentByCardMinor = make(map[string]int64)
 	}
-	if grant.SpentByCardMinor[cardID]+amountMinor > limit {
+	spent := grant.SpentByCardMinor[cardID]
+	if spent < 0 || spent > limit || amountMinor > limit-spent {
 		return ErrOfflineCapExceeded
 	}
 
-	grant.SpentByCardMinor[cardID] += amountMinor
+	grant.SpentByCardMinor[cardID] = spent + amountMinor
 	if currentWallUTC.After(grant.HWMUTC) {
 		grant.HWMUTC = currentWallUTC
 	}
@@ -167,8 +176,12 @@ func CanBurnLoyalty(
 		return err
 	}
 
+	if grant.TotalLoyaltyBurnedPoints < 0 || points > math.MaxInt64-grant.TotalLoyaltyBurnedPoints {
+		return ErrOfflineLoyaltyCapExceeded
+	}
 	if grant.LoyaltySlicePoints != nil {
-		if grant.TotalLoyaltyBurnedPoints+points > *grant.LoyaltySlicePoints {
+		capPts := *grant.LoyaltySlicePoints
+		if capPts < 0 || grant.TotalLoyaltyBurnedPoints > capPts || points > capPts-grant.TotalLoyaltyBurnedPoints {
 			return ErrOfflineLoyaltyCapExceeded
 		}
 	}

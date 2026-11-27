@@ -1,6 +1,7 @@
 package loyalty
 
 import (
+	"math"
 	"testing"
 
 	"github.com/google/uuid"
@@ -35,5 +36,17 @@ func TestEvaluateLoyaltyPrefix_ConvergenceAndRecovery(t *testing.T) {
 	}
 	if len(flags) != 1 || flags[0].ResolvedByEventID != nil {
 		t.Fatalf("expected unresolved flag, got %+v", flags)
+	}
+}
+
+func TestExceedsOfflineLoyaltyCap_OverflowSafe(t *testing.T) {
+	if !ExceedsOfflineLoyaltyCap(1, math.MaxInt64, 5000) {
+		t.Fatalf("expected prior=1 + MaxInt64 to exceed cap 5000")
+	}
+	if !ExceedsOfflineLoyaltyCap(5000, 1, 5000) {
+		t.Fatalf("expected prior=5000 + 1 to exceed cap 5000")
+	}
+	if ExceedsOfflineLoyaltyCap(4500, 500, 5000) {
+		t.Fatalf("expected prior=4500 + 500 to fit within cap 5000")
 	}
 }

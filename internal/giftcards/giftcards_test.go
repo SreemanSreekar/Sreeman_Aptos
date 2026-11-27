@@ -1,6 +1,7 @@
 package giftcards
 
 import (
+	"math"
 	"testing"
 
 	"github.com/google/uuid"
@@ -41,5 +42,17 @@ func TestEvaluateGiftCardPrefix_AdminFrozenPreserved(t *testing.T) {
 	})
 	if bal != 4000 || status != "ADMIN_FROZEN" || len(flags) != 0 {
 		t.Fatalf("unexpected result: bal=%d status=%s flags=%d", bal, status, len(flags))
+	}
+}
+
+func TestExceedsOfflineCap_OverflowSafe(t *testing.T) {
+	if !ExceedsOfflineCap(1, math.MaxInt64, 2500) {
+		t.Fatalf("expected prior=1 + MaxInt64 to exceed cap 2500")
+	}
+	if !ExceedsOfflineCap(2500, 1, 2500) {
+		t.Fatalf("expected prior=2500 + 1 to exceed cap 2500")
+	}
+	if ExceedsOfflineCap(2000, 500, 2500) {
+		t.Fatalf("expected prior=2000 + 500 to fit within cap 2500")
 	}
 }
