@@ -81,11 +81,18 @@ class TestRebuildAndSnapshot(unittest.IsolatedAsyncioTestCase):
             initial_event_count = (await r1.get_checksum()).json()["event_count"]
             first_batches_complete = asyncio.Event()
             snapshot_request_started = asyncio.Event()
+            snapshot_capture_done = asyncio.Event()
             completed_first_batches = 0
 
             async def send_stream(client: LedgerClient, batches: list[list[dict]], tid: str) -> None:
                 nonlocal completed_first_batches
+                last_index = len(batches) - 1
                 for index, b in enumerate(batches):
+                    # Hold the final batch on each replica until snapshot capture completes so
+                    # batches 1..N-2 genuinely race with admin_capture_snapshot() while the
+                    # post-snapshot tail (snapshot_event_count < final event_count) is deterministic.
+                    if index == last_index:
+                        await snapshot_capture_done.wait()
                     resp = await client.post_batch(
                         store_id=store_id, terminal_id=tid, events=b, simulated_now=now
                     )
@@ -104,9 +111,12 @@ class TestRebuildAndSnapshot(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(not task.done() for task in writer_tasks))
 
             snapshot_request_started.set()
-            snap = await r1.admin_capture_snapshot()
-            self.assertEqual(snap.status_code, 200, snap.text)
-            snapshot_event_count = snap.json()["event_count"]
+            try:
+                snap = await r1.admin_capture_snapshot()
+                self.assertEqual(snap.status_code, 200, snap.text)
+                snapshot_event_count = snap.json()["event_count"]
+            finally:
+                snapshot_capture_done.set()
             await asyncio.gather(*writer_tasks)
 
             live_chk = (await r1.get_checksum()).json()

@@ -7,8 +7,8 @@ import (
 	"github.com/google/uuid"
 )
 
-func i64(v int64) *int64 { return &v }
-func i32(v int32) *int32 { return &v }
+func i64(v int64) *int64    { return &v }
+func i32(v int32) *int32    { return &v }
 func strp(v string) *string { return &v }
 
 func TestPrepareOfflineEventsRejectsClientChannel(t *testing.T) {
