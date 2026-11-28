@@ -1250,13 +1250,18 @@ BEGIN
         sales,
         event_application_status,
         giftcard_overspend_flags,
-        loyalty_negative_flags,
-        loyalty_accounts
+        loyalty_negative_flags
     CASCADE;
 
     UPDATE gift_cards
     SET balance_minor = initial_balance_minor,
         status = CASE WHEN status = 'ADMIN_FROZEN' THEN 'ADMIN_FROZEN' ELSE 'ACTIVE' END;
+
+    UPDATE loyalty_accounts
+    SET earned_total = 0,
+        burned_total = 0,
+        balance = 0,
+        status = 'ACTIVE';
 END;
 $$;
 
@@ -1349,7 +1354,12 @@ BEGIN
 
     INSERT INTO loyalty_accounts
     SELECT account_id, earned_total, burned_total, balance, status
-    FROM snapshot_loyalty_accounts WHERE snapshot_id = p_snapshot_id;
+    FROM snapshot_loyalty_accounts WHERE snapshot_id = p_snapshot_id
+    ON CONFLICT (account_id) DO UPDATE
+    SET earned_total = EXCLUDED.earned_total,
+        burned_total = EXCLUDED.burned_total,
+        balance = EXCLUDED.balance,
+        status = EXCLUDED.status;
 
     INSERT INTO loyalty_negative_flags
     SELECT account_id, trigger_event_id, deficit_points, resolved_by_event_id

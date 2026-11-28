@@ -48,7 +48,7 @@ class HarnessConfig:
     p1_merged: bool = os.getenv("LEDGER_P1_MERGED", "1") == "1"
     p2_merged: bool = os.getenv("LEDGER_P2_MERGED", "0") == "1"
 
-    def endpoint_pair(self) -> tuple[str, str, bool]:
+    def endpoint_pair(self, *, require_distinct: bool = False) -> tuple[str, str, bool]:
         """Return (url_a, url_b, has_distinct_direct_replicas).
 
         When LEDGER_REPLICA1_URL / LEDGER_REPLICA2_URL are unset, both return base_url
@@ -61,6 +61,11 @@ class HarnessConfig:
             and self.replica2_url.strip()
             and self.replica1_url.strip().rstrip("/") != self.replica2_url.strip().rstrip("/")
         )
+        if require_distinct and not distinct:
+            raise ValueError(
+                "This integration test requires distinct direct replica URLs; set "
+                "LEDGER_REPLICA1_URL and LEDGER_REPLICA2_URL to the published API replica ports."
+            )
         return u1, u2, distinct
 
 
@@ -97,7 +102,11 @@ class LedgerClient:
     def __init__(self, base_url: str | None = None, timeout: float = 30.0) -> None:
         cfg = HarnessConfig()
         self.base_url = (base_url or cfg.base_url).rstrip("/")
-        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=timeout,
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=64),
+        )
 
     async def __aenter__(self) -> "LedgerClient":
         return self
@@ -264,7 +273,11 @@ class LedgerClient:
     async def admin_rebuild(self, mode: str = "full") -> httpx.Response:
         if mode not in ("full", "snapshot"):
             raise ValueError(f"Unsupported rebuild mode: {mode}")
-        return await self._client.post("/v1/admin/rebuild", params={"mode": mode})
+        return await self._client.post(
+            "/v1/admin/rebuild",
+            params={"mode": mode},
+            timeout=110.0,
+        )
 
 
 class DbInspector:

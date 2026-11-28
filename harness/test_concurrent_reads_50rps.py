@@ -40,6 +40,10 @@ class TestConcurrentReads50RPSPerson1(unittest.IsolatedAsyncioTestCase):
         )
 
         async with LedgerClient(cfg.base_url, timeout=30.0) as client:
+            # Warm up keep-alive pool before starting the RPS measurement window.
+            warm = await client.get_store_totals(store_id=store_id, day=day)
+            self.assertEqual(warm.status_code, 200, warm.text)
+
             stop_reading = asyncio.Event()
             partial_observations: list[int] = []
             read_count = 0
@@ -86,7 +90,7 @@ class TestConcurrentReads50RPSPerson1(unittest.IsolatedAsyncioTestCase):
                     stop_reading.set()
 
             t_begin = time.monotonic()
-            readers = [asyncio.create_task(reader_worker()) for _ in range(8)]
+            readers = [asyncio.create_task(reader_worker()) for _ in range(24)]
             await writer_worker()
             await asyncio.gather(*readers)
             duration = max(0.001, time.monotonic() - t_begin)
@@ -101,7 +105,10 @@ class TestConcurrentReads50RPS(unittest.IsolatedAsyncioTestCase):
 
     async def test_sustained_50rps_zero_partial_batch_observations(self) -> None:
         cfg = HarnessConfig()
-        store_id = "store-readiso-1"
+        run_id = uuid.uuid4().hex[:8]
+        store_id = f"store-readiso-{run_id}"
+        card_id = f"gc-readiso-{run_id}"
+        account_id = f"loy-readiso-{run_id}"
         tz = "America/New_York"
         now = datetime(2026, 6, 15, 16, 0, 0, tzinfo=timezone.utc)
         day = date(2026, 6, 15)
@@ -117,12 +124,12 @@ class TestConcurrentReads50RPS(unittest.IsolatedAsyncioTestCase):
                 ],
                 gift_cards=[
                     {
-                        "card_id": "gc-readiso-1",
+                        "card_id": card_id,
                         "initial_balance_minor": 10000,
                         "eligible_stores": [store_id],
                     }
                 ],
-                loyalty_accounts=[{"account_id": "loy-readiso-1"}],
+                loyalty_accounts=[{"account_id": account_id}],
                 simulated_now=now,
             )
 
@@ -136,8 +143,8 @@ class TestConcurrentReads50RPS(unittest.IsolatedAsyncioTestCase):
                     t_start = time.monotonic()
                     r_tot, r_gc, r_loy = await asyncio.gather(
                         client.get_store_totals(store_id=store_id, day=day),
-                        client.get_giftcard("gc-readiso-1"),
-                        client.get_loyalty("loy-readiso-1"),
+                        client.get_giftcard(card_id),
+                        client.get_loyalty(account_id),
                     )
                     self.assertEqual(r_tot.status_code, 200)
                     self.assertEqual(r_gc.status_code, 200)
@@ -171,7 +178,7 @@ class TestConcurrentReads50RPS(unittest.IsolatedAsyncioTestCase):
                 stop_reading.set()
 
             t_begin = time.monotonic()
-            readers = [asyncio.create_task(reader_worker()) for _ in range(4)]
+            readers = [asyncio.create_task(reader_worker()) for _ in range(16)]
             await writer_worker()
             await asyncio.gather(*readers)
             duration = max(0.001, time.monotonic() - t_begin)

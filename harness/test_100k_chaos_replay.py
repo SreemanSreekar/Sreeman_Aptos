@@ -3,7 +3,7 @@
 Phase 1 (v10) §5 Invariant 1:
   - 100,000 unique events + 12% duplicates (112,000 sent)
   - Shuffled within 48h, 3% orphan returns/voids, 20 store outages across 2 replicas
-  - economic_sha256 matches independent in-order Python oracle bit-for-bit
+  - applied-order offline caps and economic_sha256 match the Phase 2 contract and oracle
   - 0 unresolved valid orphans in parked_events
 
 Integration execution requires:
@@ -46,9 +46,6 @@ class Test100kChaosReplay(unittest.IsolatedAsyncioTestCase):
             )
         for la in workload.loyalty_accounts:
             oracle.seed_loyalty_account(la["account_id"])
-        oracle.add_events(workload.submitted_events)
-        expected_economic_sha = oracle.compute_economic_sha256()
-
         # Partition submitted_events into per-(store_id, terminal_id) batches while preserving
         # orphan-before-parent arrival order (orphans are already front-loaded in submitted_events).
         grouped_batches: list[tuple[str, str, list[dict]]] = []
@@ -65,7 +62,7 @@ class Test100kChaosReplay(unittest.IsolatedAsyncioTestCase):
             for (sid, tid), chunk in buckets.items():
                 grouped_batches.append((sid, tid, chunk))
 
-        u1, u2, _ = cfg.endpoint_pair()
+        u1, u2, _ = cfg.endpoint_pair(require_distinct=True)
         async with (
             LedgerClient(u1, timeout=60.0) as r1,
             LedgerClient(u2, timeout=60.0) as r2,
@@ -91,29 +88,86 @@ class Test100kChaosReplay(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(resp.status_code, 200, resp.text)
 
-            # Send orphan-bearing batches before parent-bearing batches, parallelized within each wave.
-            orphan_batch_count = sum(
-                1 for _, _, c in grouped_batches if any(e["event_id"] in workload.orphan_event_ids for e in c)
-            )
-            await asyncio.gather(
-                *(
-                    send_batch(i, sid, tid, chunk)
-                    for i, (sid, tid, chunk) in enumerate(grouped_batches[:orphan_batch_count])
+            # Normal stores remain connected; outage-store events stay queued until the
+            # reconnect wave. Orphans are still sent before parent-bearing batches per wave.
+            outage_stores = set(workload.outage_store_ids)
+            for is_outage_wave in (False, True):
+                wave_batches = [
+                    batch
+                    for batch in grouped_batches
+                    if (batch[0] in outage_stores) == is_outage_wave
+                ]
+                self.assertTrue(wave_batches)
+                await asyncio.gather(
+                    *(
+                        send_batch(i, sid, tid, chunk)
+                        for i, (sid, tid, chunk) in enumerate(wave_batches)
+                    )
                 )
-            )
-            await asyncio.gather(
-                *(
-                    send_batch(i, sid, tid, chunk)
-                    for i, (sid, tid, chunk) in enumerate(grouped_batches[orphan_batch_count:])
-                )
-            )
 
             chk_resp = await r1.get_checksum()
             self.assertEqual(chk_resp.status_code, 200, chk_resp.text)
             chk = chk_resp.json()
-            self.assertEqual(chk["economic_sha256"], expected_economic_sha)
 
         db = DbInspector(cfg.app_dsn)
+        event_count = await db.fetch_scalar(
+            "SELECT COUNT(*) FROM ledger_events WHERE event_type <> 'day_close'"
+        )
+        self.assertEqual(event_count, 100_000)
+
+        # Phase 2 defines offline cap acceptance by applied_order, not occurred_at.
+        # Validate those decisions independently, then give only accepted gift-card
+        # events to the economic oracle, which recomputes their canonical balances.
+        giftcard_rows = await db.fetch_all(
+            """
+            SELECT le.event_id::text, le.card_id, le.store_id, le.epoch_gen,
+                   le.amount_minor, le.channel, eas.status, eas.rejection_reason
+            FROM ledger_events le
+            JOIN event_application_status eas ON eas.event_id = le.event_id
+            WHERE le.event_type = 'giftcard_redeem'
+            ORDER BY le.applied_order ASC
+            """
+        )
+        self.assertEqual(len(giftcard_rows), 10_000)
+        expected_gc_ids = {
+            ev["event_id"]
+            for ev in workload.unique_events
+            if ev["event_type"] == "giftcard_redeem"
+        }
+        self.assertEqual({row[0] for row in giftcard_rows}, expected_gc_ids)
+        offline_cap = await db.fetch_scalar(
+            "SELECT giftcard_offline_store_cap_minor FROM ledger_config WHERE id = 1"
+        )
+        self.assertIsNotNone(offline_cap)
+        applied_gc_ids: set[str] = set()
+        spend_by_epoch: dict[tuple[str, str, int], int] = {}
+        for event_id, card_id, store_id, epoch_gen, amount, channel, status, reason in giftcard_rows:
+            self.assertEqual(channel, "OFFLINE")
+            self.assertIsNotNone(epoch_gen)
+            cap_key = (card_id, store_id, epoch_gen)
+            prior_spend = spend_by_epoch.get(cap_key, 0)
+            if status == "APPLIED":
+                self.assertLessEqual(prior_spend + amount, offline_cap)
+                spend_by_epoch[cap_key] = prior_spend + amount
+                applied_gc_ids.add(event_id)
+            else:
+                self.assertEqual((status, reason), ("REJECTED_INVALID", "OFFLINE_CAP_EXCEEDED"))
+                self.assertGreater(prior_spend + amount, offline_cap)
+
+        oracle.add_events(
+            ev
+            for ev in workload.unique_events
+            if ev["event_type"] != "giftcard_redeem" or ev["event_id"] in applied_gc_ids
+        )
+        oracle.evaluate()
+        self.assertTrue(
+            all(
+                oracle.event_status[event_id] == ("APPLIED", None)
+                for event_id in applied_gc_ids
+            )
+        )
+        self.assertEqual(chk["economic_sha256"], oracle.compute_economic_sha256())
+
         pending_orphans = await db.fetch_scalar(
             "SELECT COUNT(*) FROM parked_events WHERE status = 'PENDING_PARENT'"
         )

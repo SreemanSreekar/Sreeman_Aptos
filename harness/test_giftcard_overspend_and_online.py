@@ -96,30 +96,45 @@ class TestGiftCardOfflineSimulatorProof(unittest.TestCase):
 class TestGiftCardOverspendAndOnline(unittest.IsolatedAsyncioTestCase):
     async def test_40_cards_offline_6th_store_concurrent_sync_and_online(self) -> None:
         cfg = HarnessConfig()
+        run_id = uuid.uuid4().hex[:8]
+        store_ids = {i: f"store-gc-{run_id}-{i}" for i in range(1, 7)}
+        card_ids = {i: f"gc-live-{run_id}-{i:02d}" for i in range(1, 41)}
+        online_only_card_id = f"gc-online-only-{run_id}"
         t0 = datetime(2026, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
         stores = [
-            {"store_id": f"store-gc-{i}", "iana_timezone": "America/New_York", "terminal_ids": ["t1", "t2"]}
+            {"store_id": store_ids[i], "iana_timezone": "America/New_York", "terminal_ids": ["t1", "t2"]}
             for i in range(1, 7)
         ]
         cards = [
             {
-                "card_id": f"gc-live-{i:02d}",
+                "card_id": card_ids[i],
                 "initial_balance_minor": 1000,
-                "eligible_stores": [f"store-gc-{k}" for k in range(1, 2 + (i % 5))],
+                "eligible_stores": [store_ids[k] for k in range(1, 2 + (i % 5))],
             }
             for i in range(1, 41)
         ]
 
-        u1, u2, _ = cfg.endpoint_pair()
+        u1, u2, _ = cfg.endpoint_pair(require_distinct=True)
         async with (
             LedgerClient(u1) as r1,
             LedgerClient(u2) as r2,
         ):
             await r1.admin_seed(stores=stores, gift_cards=cards, simulated_now=t0)
 
-            # (a) Redeem across eligible stores (2 terminals per store) and upload via /sync
-            for s_idx in range(1, 6):
-                sid = f"store-gc-{s_idx}"
+            # (a) Queue all five eligible-store uploads together to exercise cross-store
+            # gift-card cap enforcement while the same cards are being redeemed concurrently.
+            stores_ready = 0
+            all_stores_ready = asyncio.Event()
+            start_uploads = asyncio.Event()
+
+            async def upload_store(s_idx: int) -> None:
+                nonlocal stores_ready
+                sid = store_ids[s_idx]
+                stores_ready += 1
+                if stores_ready == 5:
+                    all_stores_ready.set()
+                await start_uploads.wait()
+
                 for tid in ("t1", "t2"):
                     evs = []
                     seq = 0
@@ -149,6 +164,14 @@ class TestGiftCardOverspendAndOnline(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(resp.status_code, 200, resp.text)
 
+            store_uploads = [
+                asyncio.create_task(upload_store(s_idx))
+                for s_idx in range(1, 6)
+            ]
+            await all_stores_ready.wait()
+            start_uploads.set()
+            await asyncio.gather(*store_uploads)
+
             for c in cards:
                 gc = (await r1.get_giftcard(c["card_id"])).json()
                 overdraft = max(0, c["initial_balance_minor"] - gc["balance_minor"])
@@ -159,16 +182,16 @@ class TestGiftCardOverspendAndOnline(unittest.IsolatedAsyncioTestCase):
 
             # (b) 6th store attempt rejected centrally if submitted in batch
             sixth_ev = make_giftcard_redeem_event(
-                store_id="store-gc-6",
+                store_id=store_ids[6],
                 terminal_id="t1",
                 occurred_at=t0 + timedelta(minutes=5),
-                card_id="gc-live-01",
+                card_id=card_ids[1],
                 amount_minor=500,
                 epoch_gen=1,
                 terminal_epoch_seq=1,
             )
             await r1.post_batch(
-                store_id="store-gc-6",
+                store_id=store_ids[6],
                 terminal_id="t1",
                 events=[sixth_ev],
                 simulated_now=t0 + timedelta(minutes=10),
@@ -184,17 +207,17 @@ class TestGiftCardOverspendAndOnline(unittest.IsolatedAsyncioTestCase):
             # Epoch 2: fence t2 -> t1 syncs alone -> advances to epoch 3 while t2's epoch-2 slice stays FENCED
             fence_now = t0 + timedelta(hours=1, seconds=22_201)
             f_resp = await r1.fence_terminal(
-                store_id="store-gc-1", terminal_id="t2", epoch_gen=2, simulated_now=fence_now
+                store_id=store_ids[1], terminal_id="t2", epoch_gen=2, simulated_now=fence_now
             )
             self.assertEqual(f_resp.status_code, 200, f_resp.text)
 
             # Spend on multiple cards in epoch 2 on t1 before sync advances to epoch 3
             e2_evs = [
                 make_giftcard_redeem_event(
-                    store_id="store-gc-1",
+                    store_id=store_ids[1],
                     terminal_id="t1",
                     occurred_at=fence_now - timedelta(hours=2),
-                    card_id=f"gc-live-{k:02d}",
+                    card_id=card_ids[k],
                     amount_minor=250,
                     epoch_gen=2,
                     terminal_epoch_seq=k,
@@ -202,7 +225,7 @@ class TestGiftCardOverspendAndOnline(unittest.IsolatedAsyncioTestCase):
                 for k in (1, 2, 3)
             ]
             s_e2_t1 = await r1.sync_terminal(
-                store_id="store-gc-1",
+                store_id=store_ids[1],
                 terminal_id="t1",
                 epoch_gen=2,
                 events=e2_evs,
@@ -215,14 +238,15 @@ class TestGiftCardOverspendAndOnline(unittest.IsolatedAsyncioTestCase):
             # Verify ACTIVE(epoch 3) + FENCED(epoch 2) <= 2500
             active_fenced_mid = await db.fetch_scalar(
                 "SELECT COALESCE(SUM(slice_minor), 0) FROM terminal_offline_slices "
-                "WHERE store_id = 'store-gc-1' AND state IN ('ACTIVE', 'FENCED')"
+                "WHERE store_id = %s AND state IN ('ACTIVE', 'FENCED')",
+                (store_ids[1],),
             )
             self.assertLessEqual(active_fenced_mid, 2500)
 
             # Concurrent FENCED -> RECONCILED (t2 epoch 2) + ACTIVE sync (t1 epoch 3) across both replicas
             s_t1_e3, s_t2_e2 = await asyncio.gather(
                 r1.sync_terminal(
-                    store_id="store-gc-1",
+                    store_id=store_ids[1],
                     terminal_id="t1",
                     epoch_gen=3,
                     events=[],
@@ -231,7 +255,7 @@ class TestGiftCardOverspendAndOnline(unittest.IsolatedAsyncioTestCase):
                     simulated_now=fence_now + timedelta(seconds=10),
                 ),
                 r2.sync_terminal(
-                    store_id="store-gc-1",
+                    store_id=store_ids[1],
                     terminal_id="t2",
                     epoch_gen=2,
                     events=[],
@@ -245,14 +269,16 @@ class TestGiftCardOverspendAndOnline(unittest.IsolatedAsyncioTestCase):
 
             active_fenced_sum = await db.fetch_scalar(
                 "SELECT COALESCE(SUM(slice_minor), 0) FROM terminal_offline_slices "
-                "WHERE store_id = 'store-gc-1' AND state IN ('ACTIVE', 'FENCED')"
+                "WHERE store_id = %s AND state IN ('ACTIVE', 'FENCED')",
+                (store_ids[1],),
             )
             self.assertLessEqual(active_fenced_sum, 2500)
 
             # Assert zero double-allocated slices across epochs
             dup_slices = await db.fetch_scalar(
                 "SELECT COUNT(*) - COUNT(DISTINCT (store_id, terminal_id, epoch_gen)) "
-                "FROM terminal_offline_slices WHERE store_id = 'store-gc-1'"
+                "FROM terminal_offline_slices WHERE store_id = %s",
+                (store_ids[1],),
             )
             self.assertEqual(dup_slices, 0)
 
@@ -265,18 +291,18 @@ class TestGiftCardOverspendAndOnline(unittest.IsolatedAsyncioTestCase):
             await r1.admin_seed(
                 gift_cards=[
                     {
-                        "card_id": "gc-online-only",
+                        "card_id": online_only_card_id,
                         "initial_balance_minor": 1000,
-                        "eligible_stores": ["store-gc-1"],
+                        "eligible_stores": [store_ids[1]],
                     }
                 ]
             )
             online_reqs = [
                 (r1 if i % 2 == 0 else r2).online_redeem_giftcard(
                     event_id=str(uuid.uuid4()),
-                    store_id="store-gc-1",
+                    store_id=store_ids[1],
                     terminal_id="t1",
-                    card_id="gc-online-only",
+                    card_id=online_only_card_id,
                     amount_minor=600,
                     occurred_at=fence_now + timedelta(seconds=20 + i),
                     simulated_now=fence_now + timedelta(seconds=25),
@@ -286,7 +312,7 @@ class TestGiftCardOverspendAndOnline(unittest.IsolatedAsyncioTestCase):
             resps = await asyncio.gather(*online_reqs)
             ok_count = sum(1 for r in resps if r.status_code == 200)
             self.assertEqual(ok_count, 1)
-            gc_on = (await r1.get_giftcard("gc-online-only")).json()
+            gc_on = (await r1.get_giftcard(online_only_card_id)).json()
             self.assertEqual(gc_on["balance_minor"], 400)
 
 
