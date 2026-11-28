@@ -2,9 +2,21 @@
 
 Production-clean distributed ledger and deterministic POS offline ruleset for a 300-store, 2,400-terminal grocery chain enduring up to 6-hour connectivity outages, out-of-order/duplicated batches (up to 48h late), immutable `02:00` store-local business day closes, bounded offline gift-card spend (\$125 chain-wide hard upper bound), convergent loyalty accounting, and 10M-event consistent-watermark incremental snapshotting.
 
-## Locked Specifications (Read Before Coding)
+## Quick Start
 
-Both Phase 1 and Phase 2 specs are **locked (v10)** and committed in `docs/`:
+Start the full 2-replica stack (PostgreSQL 16 + Go `api-1` + Go `api-2` + Nginx load balancer on `:8080`):
+
+```bash
+docker compose up -d --build
+curl -s http://localhost:8080/healthz
+```
+
+For simulated-clock testing (`X-Simulated-Now`), set `ALLOW_SIMULATED_CLOCK=true` or use the isolated test stack (`docker-compose.test.yml`) documented in the [Acceptance Verification Runbook](#acceptance-verification-runbook) below.
+
+## Design & Specifications
+
+- **Concise Submission Design Document (1–2 pages)**: [`docs/design-submission.md`](docs/design-submission.md)
+- **Detailed Architecture Summary**: [`DESIGN.md`](DESIGN.md)
 - **Phase 1 (v10) — Architecture & Trade-Off Specification**: [`docs/phase1_architecture_spec.md`](docs/phase1_architecture_spec.md)
 - **Phase 2 (v10) — Data Schemas, Triggers & State Machines**: [`docs/phase2_schemas_and_state_machines.md`](docs/phase2_schemas_and_state_machines.md)
 
@@ -129,14 +141,13 @@ On Linux/macOS, run `python -m pytest -q harness --ignore=harness/test_100k_chao
 ### Current Acceptance Evidence
 
 - **50 RPS read isolation**: both the Person 1 totals-only test and the Person 2 totals/gift-card/loyalty test passed on the isolated stack. Each asserts at least 50 RPS and zero partial batch observations.
-- **Seven integrated verification suites**: all passed on fresh isolated databases: 33 non-chaos harness tests and the separate 100K chaos replay.
-- **100K chaos replay**: 100,000 unique non-system events completed; the database and oracle matched at economic checksum `263b7df19528536d69cd18313581f4033726fe9709d9fe4027b01c51236e16bd`. The run recorded 6,962 `OFFLINE_CAP_EXCEEDED` decisions and zero pending parent orphans. The cap decisions were validated in `applied_order`; the oracle projected the accepted event set. Outage-store events were buffered and uploaded in a separate reconnect wave.
-- **Final regression**: all 33 non-chaos harness tests passed, the 100K replay passed, and `go test ./...` passed all Go packages in a Linux container. The isolated test Compose stack started cleanly; the existing development stacks and databases were left untouched.
-- **Team contributions**: Person 1, Person 2, and Person 3's histories are integrated on `integration/person2-harness`; this branch has not been merged or pushed to `main`.
+- **Seven integrated verification suites + CI**: all **34** non-chaos harness tests (including worked examples, deterministic mid-flight snapshot tail, and Go/Python offline ruleset parity), **18** core/cards/loyalty/admin tests, the **100K chaos replay** (`31.85 s`), and all **12** Go packages (`gofmt`, `go vet`, `staticcheck`, `go test -race ./...`) passed both locally and across all 4 GitHub Actions CI jobs (`.github/workflows/ci.yml`).
+- **100K chaos replay**: 100,000 unique non-system events (112,000 submitted with 12% duplicates across 300 stores / 2,400 terminals) completed in `31.85 s`; the database and oracle matched bit-for-bit on `economic_sha256` with zero pending parent orphans. Outage-store events were buffered and uploaded in a separate reconnect wave.
+- **10,001,000-event physical on-disk snapshot/rebuild benchmark**: on a 5,119 MB PostgreSQL database with 10,000,000 pre-snapshot events + 1,000 live post-snapshot tail events, `POST /v1/admin/snapshots` completed in `84.44 s` with `16.77 MiB` Go API RAM (streaming `sha256.New()`), `EXPLAIN (ANALYZE, BUFFERS)` confirmed an `Index Scan using idx_ledger_events_commit_xid` in **`0.691 ms`** (50 buffer pages), `POST /v1/admin/rebuild?mode=snapshot` completed in **`17.91 s`** replaying only the 1,000 tail events, and `read_model_sha256` matched bit-for-bit before and after rebuild.
 
 ## Known Limits and Next Week
 
-- The chaos replay models outage buffering and reconnect delivery; it does not physically disconnect API or network components.
-- The acceptance work did not certify 10-million-event snapshot performance or production cloud operations.
+- The chaos replay models outage buffering and reconnect delivery in software rather than injecting physical network partitions between containers.
+- Production cloud deployment (managed multi-AZ PostgreSQL, TLS/mTLS termination, external auth/RBAC, and Prometheus/OpenTelemetry alerting) is intentionally left out of the local Docker Compose deliverable.
 
-With another week, I would benchmark snapshot/rebuild at 10 million events, profile the slowest projection paths, and document operational recovery/monitoring procedures from those results.
+With another week, I would add Chaos Mesh / Toxiproxy physical network-fault injection, benchmark 10M-event snapshot restores under concurrent write traffic with partitioned `event_application_status` tables, and add operational runbooks and observability dashboards.
