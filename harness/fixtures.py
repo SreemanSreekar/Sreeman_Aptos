@@ -190,12 +190,18 @@ def generate_chaos_workload(
     - `duplicate_rate` exact duplicates (12% -> 112,000 total submitted)
     - `orphan_rate` returns/voids placed BEFORE their parent sale in delivery order
     - Shuffled within a 48h lateness window (`[anchor_now - 47h, anchor_now - 1m]`)
-    - `outage_stores` designated stores emitting bursts after simulated 6h outages
+    - `outage_stores` designated stores whose events occur during a 6h outage window
+      and are held for a reconnect upload wave
     """
     rng = random.Random(seed)
     now = anchor_now or datetime(2026, 6, 15, 16, 0, 0, tzinfo=timezone.utc)
     stores = generate_chain_topology(store_count=store_count, terminals_per_store=terminals_per_store)
     outage_store_ids = [s["store_id"] for s in stores[:outage_stores]]
+    outage_store_set = set(outage_store_ids)
+
+    def occurrence_time(store_id: str) -> datetime:
+        max_age_seconds = 6 * 3600 if store_id in outage_store_set else 46 * 3600
+        return now - timedelta(seconds=rng.randint(60, max_age_seconds))
 
     gift_cards = []
     for c_idx in range(1, giftcard_count + 1):
@@ -227,12 +233,7 @@ def generate_chaos_workload(
     for idx in range(target_sales):
         st = stores[idx % store_count]
         tid = st["terminal_ids"][idx % terminals_per_store]
-        # Outage stores concentrate timestamps within a 6h outage window inside last 46h
-        if st["store_id"] in outage_store_ids:
-            offset_sec = rng.randint(60, 6 * 3600)
-        else:
-            offset_sec = rng.randint(60, 46 * 3600)
-        occ = now - timedelta(seconds=offset_sec)
+        occ = occurrence_time(st["store_id"])
         amt = rng.randint(200, 15000)
         sale_id = deterministic_uuid(f"chaos-{seed}-sale-{idx}")
         ev_id = deterministic_uuid(f"chaos-{seed}-ev-sale-{idx}")
@@ -291,7 +292,7 @@ def generate_chaos_workload(
         gc_store_spend[(card["card_id"], sid)] = used + amt
         seq = term_epoch_seq.get((sid, tid), 0) + 1
         term_epoch_seq[(sid, tid)] = seq
-        occ = now - timedelta(seconds=rng.randint(60, 46 * 3600))
+        occ = occurrence_time(sid)
         ev_id = deterministic_uuid(f"chaos-{seed}-ev-gc-{idx}")
         unique_events.append(
             make_giftcard_redeem_event(
@@ -311,7 +312,7 @@ def generate_chaos_workload(
         sid = st["store_id"]
         tid = st["terminal_ids"][idx % terminals_per_store]
         acct = loyalty_accounts[idx % loyalty_count]["account_id"]
-        occ = now - timedelta(seconds=rng.randint(60, 46 * 3600))
+        occ = occurrence_time(sid)
         ev_id = deterministic_uuid(f"chaos-{seed}-ev-loy-{idx}")
         if idx % 3 == 0:
             seq = term_epoch_seq.get((sid, tid), 0) + 1

@@ -33,7 +33,7 @@ class TestBusinessDayImmutabilityPerson1(unittest.IsolatedAsyncioTestCase):
 
     async def test_early_close_idempotent_retry_orphan_routing_and_trigger_guard(self) -> None:
         cfg = HarnessConfig()
-        u1, u2, _ = cfg.endpoint_pair()
+        u1, u2, _ = cfg.endpoint_pair(require_distinct=True)
         store_id = f"store-p3-day-{uuid.uuid4().hex[:6]}"
         tz = "America/New_York"
         monday = date(2026, 6, 15)
@@ -161,7 +161,7 @@ class TestBusinessDayImmutabilityPerson1(unittest.IsolatedAsyncioTestCase):
                 store_id=store_id,
                 terminal_id="term-1",
                 events=[s_before, s_at],
-                simulated_now=spring_cutoff + timedelta(minutes=5),
+                simulated_now=spring_cutoff - timedelta(seconds=1),
             )
             r_early_sp = await client.close_business_day(
                 store_id=store_id,
@@ -198,7 +198,7 @@ class TestBusinessDayImmutabilityPerson1(unittest.IsolatedAsyncioTestCase):
                 store_id=store_id,
                 terminal_id="term-1",
                 events=[f_fold0, f_fold1, f_after],
-                simulated_now=fall_cutoff + timedelta(minutes=5),
+                simulated_now=fall_cutoff - timedelta(seconds=1),
             )
             r_early_fb = await client.close_business_day(
                 store_id=store_id,

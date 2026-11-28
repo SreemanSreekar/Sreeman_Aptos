@@ -84,7 +84,7 @@ To avoid merge conflicts, each owner has strictly disjoint directories and a ded
    - `harness/test_loyalty_convergence.py`: Opposite-permutation offline earn/burn convergence, claim-first online burn, `NEGATIVE_RESTRICTED` online block & earn-back recovery.
    - `harness/test_rebuild_and_snapshot.py`: Capture snapshot *during* live 2-replica writes → verify `live read_model_sha256 == full rebuild read_model_sha256 == snapshot + tail rebuild read_model_sha256` bit-for-bit.
 3. **Documentation**:
-   - `DESIGN.md` (concise 1–2 page architecture & trade-off summary distilled from Phase 1/2 v10).
+   - `docs/design-submission.md` (concise 1–2 page architecture & trade-off summary distilled from Phase 1/2 v10); `DESIGN.md` and the locked specs retain the detailed rationale.
    - Finalize `README.md` with verified run/test commands and benchmark results.
 
 ---
@@ -94,3 +94,45 @@ To avoid merge conflicts, each owner has strictly disjoint directories and a ded
 1. **Step 0 (Person 1 Foundation PR → `main`)**: Merge `docker-compose.yml`, `migrations/001_init.sql`, `go.mod`, server skeleton, shared helpers, and the `Projector` interface stub.
 2. **Parallel Feature Development**: All 3 owners build concurrently on `feat/core-ledger`, `feat/cards-loyalty-admin`, and `feat/harness-docs`.
 3. **Integration & Verification**: Merge Person 1 + Person 2 into `main`, run `docker compose up --build`, and execute Person 3's 7-suite `harness/` against `http://localhost:8080`.
+
+## Acceptance Verification Runbook
+
+Use the isolated test Compose stack, not the default development database, for acceptance checks. The suites compare whole-ledger checksums and require an empty database. The test stack maps Nginx to `:8081`, replicas to `:8082`/`:8083`, and PostgreSQL to `:5434`.
+
+Live integration cases are skipped unless `LEDGER_INTEGRATION=1` is set before pytest starts. The Person 2 cases also require `LEDGER_P2_MERGED=1`; the direct replica URLs below are required by tests that verify behavior across both API replicas. Without these settings, the harness runs its local unit tests but does not exercise the live stack.
+
+The test Compose file accepts `LEDGER_TEST_POSTGRES_PORT`, `LEDGER_TEST_NGINX_PORT`, `LEDGER_TEST_API1_PORT`, and `LEDGER_TEST_API2_PORT` overrides if its default host ports are already in use; point the harness URLs and `POSTGRES_HOST_PORT` at the selected values.
+
+```powershell
+# Only when the existing test data is disposable: this removes the test stack's named volume.
+docker compose -p sreeman-acceptance -f docker-compose.test.yml down -v
+docker compose -p sreeman-acceptance -f docker-compose.test.yml up -d --build
+
+$env:LEDGER_INTEGRATION = "1"
+$env:LEDGER_P1_MERGED = "1"
+$env:LEDGER_P2_MERGED = "1"
+$env:LEDGER_BASE_URL = "http://localhost:8081"
+$env:LEDGER_REPLICA1_URL = "http://localhost:8082"
+$env:LEDGER_REPLICA2_URL = "http://localhost:8083"
+$env:POSTGRES_HOST_PORT = "5434"
+
+# Windows: psycopg async connections require a Selector event loop.
+python -c "import asyncio, pytest; asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy()); raise SystemExit(pytest.main(['-q', 'harness']))"
+```
+
+On Linux/macOS, run `python -m pytest -q harness` after setting the same integration variables. Run the 100K chaos replay last because it intentionally leaves its workload in the test database; reset the test volume before any later full-ledger checksum run.
+
+### Current Acceptance Evidence
+
+- **50 RPS read isolation**: both the Person 1 totals-only test and the Person 2 totals/gift-card/loyalty test passed on the isolated stack. Each asserts at least 50 RPS and zero partial batch observations.
+- **Seven integrated verification suites**: all passed on fresh isolated databases: 33 non-chaos harness tests and the separate 100K chaos replay.
+- **100K chaos replay**: 100,000 unique non-system events completed; the database and oracle matched at economic checksum `263b7df19528536d69cd18313581f4033726fe9709d9fe4027b01c51236e16bd`. The run recorded 6,962 `OFFLINE_CAP_EXCEEDED` decisions and zero pending parent orphans. The cap decisions were validated in `applied_order`; the oracle projected the accepted event set. Outage-store events were buffered and uploaded in a separate reconnect wave.
+- **Final regression**: all 33 non-chaos harness tests passed, the 100K replay passed, and `go test ./...` passed all Go packages in a Linux container. The isolated test Compose stack started cleanly; the existing development stacks and databases were left untouched.
+- **Team contributions**: Person 1, Person 2, and Person 3's histories are integrated on `integration/person2-harness`; this branch has not been merged or pushed to `main`.
+
+## Known Limits and Next Week
+
+- The chaos replay models outage buffering and reconnect delivery; it does not physically disconnect API or network components.
+- The acceptance work did not certify 10-million-event snapshot performance or production cloud operations.
+
+With another week, I would benchmark snapshot/rebuild at 10 million events, profile the slowest projection paths, and document operational recovery/monitoring procedures from those results.

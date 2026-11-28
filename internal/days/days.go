@@ -416,46 +416,49 @@ func (h *Handler) GetStoreTotals(w http.ResponseWriter, r *http.Request) {
 	var notFound bool
 
 	err = db.WithReadOnlyTx(r.Context(), h.Pools.App, func(tx pgx.Tx) error {
-		var exists bool
-		if err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM stores WHERE store_id = $1)`, storeID).Scan(&exists); err != nil {
-			return err
-		}
-		if !exists {
+		var dayStatus, tzVersion string
+		var cutoffUTC time.Time
+		var closedAt *time.Time
+		var closeEventID *uuid.UUID
+		var salesMinor, returnsMinor, voidsMinor, gcRedeemMinor, adjNetMinor, netTotalMinor int64
+
+		// Fetch store existence, business-day metadata, and totals in one round trip.
+		err := tx.QueryRow(r.Context(), `
+			SELECT
+				COALESCE(bd.status, 'OPEN'),
+				COALESCE(bd.cutoff_utc, '0001-01-01'::timestamptz),
+				COALESCE(bd.tz_version, ''),
+				bd.closed_at_utc,
+				bd.close_event_id,
+				COALESCE(t.sales_minor, 0),
+				COALESCE(t.returns_minor, 0),
+				COALESCE(t.voids_minor, 0),
+				COALESCE(t.giftcard_redeem_minor, 0),
+				COALESCE(t.adjustments_net_minor, 0),
+				COALESCE(t.net_total_minor, 0)
+			FROM stores s
+			LEFT JOIN store_business_days bd
+				ON bd.store_id = s.store_id AND bd.business_day = $2
+			LEFT JOIN store_day_totals t
+				ON t.store_id = s.store_id AND t.business_day = $2
+			WHERE s.store_id = $1`,
+			storeID, day,
+		).Scan(
+			&dayStatus, &cutoffUTC, &tzVersion, &closedAt, &closeEventID,
+			&salesMinor, &returnsMinor, &voidsMinor, &gcRedeemMinor,
+			&adjNetMinor, &netTotalMinor,
+		)
+		if errors.Is(err, pgx.ErrNoRows) {
 			notFound = true
 			return nil
 		}
-
-		var dayStatus string
-		var cutoffUTC time.Time
-		var tzVersion string
-		var closedAt *time.Time
-		var closeEventID *uuid.UUID
-
-		err := tx.QueryRow(r.Context(), `
-			SELECT status, cutoff_utc, tz_version, closed_at_utc, close_event_id
-			FROM store_business_days
-			WHERE store_id = $1 AND business_day = $2`,
-			storeID, day,
-		).Scan(&dayStatus, &cutoffUTC, &tzVersion, &closedAt, &closeEventID)
-		if errors.Is(err, pgx.ErrNoRows) {
-			dayStatus = "OPEN"
-		} else if err != nil {
-			return err
-		}
-
-		var salesMinor, returnsMinor, voidsMinor, gcRedeemMinor, adjNetMinor, netTotalMinor int64
-		err = tx.QueryRow(r.Context(), `
-			SELECT sales_minor, returns_minor, voids_minor, giftcard_redeem_minor, adjustments_net_minor, net_total_minor
-			FROM store_day_totals
-			WHERE store_id = $1 AND business_day = $2`,
-			storeID, day,
-		).Scan(&salesMinor, &returnsMinor, &voidsMinor, &gcRedeemMinor, &adjNetMinor, &netTotalMinor)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		if err != nil {
 			return err
 		}
 
 		rows, err := tx.Query(r.Context(), `
-			SELECT origin_business_day, event_id, entry_kind, revision, caused_by_event_id, event_type, amount_delta_minor
+			SELECT origin_business_day, event_id, entry_kind, revision,
+			       caused_by_event_id, event_type, amount_delta_minor
 			FROM store_day_adjustments
 			WHERE store_id = $1 AND posting_business_day = $2
 			ORDER BY origin_business_day ASC, event_id ASC, entry_kind ASC, revision ASC`,

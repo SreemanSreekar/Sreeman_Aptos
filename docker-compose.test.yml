@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_dev_password
+      POSTGRES_DB: ledger
+      LEDGER_APP_PASSWORD: ledger_app_dev_pw
+      LEDGER_ADMIN_PASSWORD: ledger_admin_dev_pw
+    ports:
+      - "${LEDGER_TEST_POSTGRES_PORT:-5434}:5432"
+    volumes:
+      - aptos_test_pgdata:/var/lib/postgresql/data
+      - ./migrations/000_roles.sh:/docker-entrypoint-initdb.d/000_roles.sh:ro
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ledger"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  api-1:
+    ports:
+      - "${LEDGER_TEST_API1_PORT:-8082}:8080"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      PORT: "8080"
+      REPLICA_ID: "test-api-1"
+      DATABASE_URL: "postgres://ledger_app:ledger_app_dev_pw@postgres:5432/ledger?sslmode=disable"
+      ADMIN_DATABASE_URL: "postgres://ledger_admin:ledger_admin_dev_pw@postgres:5432/ledger?sslmode=disable"
+      ALLOW_SIMULATED_CLOCK: "true"
+      MAX_FUTURE_SKEW_SECONDS: "300"
+      MAX_EVENT_LATENESS_HOURS: "48"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  api-2:
+    ports:
+      - "${LEDGER_TEST_API2_PORT:-8083}:8080"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      PORT: "8080"
+      REPLICA_ID: "test-api-2"
+      DATABASE_URL: "postgres://ledger_app:ledger_app_dev_pw@postgres:5432/ledger?sslmode=disable"
+      ADMIN_DATABASE_URL: "postgres://ledger_admin:ledger_admin_dev_pw@postgres:5432/ledger?sslmode=disable"
+      ALLOW_SIMULATED_CLOCK: "true"
+      MAX_FUTURE_SKEW_SECONDS: "300"
+      MAX_EVENT_LATENESS_HOURS: "48"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "${LEDGER_TEST_NGINX_PORT:-8081}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api-1:
+        condition: service_healthy
+      api-2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+volumes:
+  aptos_test_pgdata:

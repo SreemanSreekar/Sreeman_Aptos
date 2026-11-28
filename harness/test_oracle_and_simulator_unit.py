@@ -6,6 +6,7 @@ Runnable with either `python -m unittest` (stdlib) or `pytest`.
 from __future__ import annotations
 
 import hashlib
+import os
 import random
 import unittest
 import uuid
@@ -178,13 +179,40 @@ class CanonicalHelpersTests(unittest.TestCase):
 
     def test_client_docker_compose_defaults(self) -> None:
         cfg = HarnessConfig()
-        self.assertEqual(cfg.base_url, "http://localhost:8080")
-        self.assertIn(":5433/", cfg.app_dsn)
-        self.assertIn(":5433/", cfg.admin_dsn)
+        expected_base_url = os.getenv("LEDGER_BASE_URL", "http://localhost:8080")
+        expected_port = os.getenv("POSTGRES_HOST_PORT", "5433")
+        expected_app_dsn = os.getenv(
+            "LEDGER_APP_DSN",
+            f"postgresql://ledger_app:{os.getenv('LEDGER_APP_PASSWORD', 'ledger_app_dev_pw')}@127.0.0.1:{expected_port}/ledger",
+        )
+        expected_admin_dsn = os.getenv(
+            "LEDGER_ADMIN_DSN",
+            f"postgresql://ledger_admin:{os.getenv('LEDGER_ADMIN_PASSWORD', 'ledger_admin_dev_pw')}@127.0.0.1:{expected_port}/ledger",
+        )
+        self.assertEqual(cfg.base_url, expected_base_url)
+        self.assertEqual(cfg.app_dsn, expected_app_dsn)
+        self.assertEqual(cfg.admin_dsn, expected_admin_dsn)
         u1, u2, distinct = cfg.endpoint_pair()
-        self.assertEqual(u1, "http://localhost:8080")
-        self.assertEqual(u2, "http://localhost:8080")
-        self.assertFalse(distinct)
+        self.assertEqual(u1, os.getenv("LEDGER_REPLICA1_URL", "") or expected_base_url)
+        self.assertEqual(u2, os.getenv("LEDGER_REPLICA2_URL", "") or expected_base_url)
+        expected_distinct = bool(
+            os.getenv("LEDGER_REPLICA1_URL", "").strip()
+            and os.getenv("LEDGER_REPLICA2_URL", "").strip()
+            and os.getenv("LEDGER_REPLICA1_URL", "").strip().rstrip("/")
+            != os.getenv("LEDGER_REPLICA2_URL", "").strip().rstrip("/")
+        )
+        self.assertEqual(distinct, expected_distinct)
+
+    def test_replica_pair_can_require_distinct_direct_urls(self) -> None:
+        cfg = HarnessConfig(replica1_url="", replica2_url="")
+        with self.assertRaisesRegex(ValueError, "requires distinct direct replica URLs"):
+            cfg.endpoint_pair(require_distinct=True)
+
+        cfg = HarnessConfig(
+            replica1_url="http://localhost:8082",
+            replica2_url="http://localhost:8083",
+        )
+        self.assertTrue(cfg.endpoint_pair(require_distinct=True)[2])
 
     def test_business_day_half_open_and_dst_spring_forward_fall_back(self) -> None:
         tz = "America/New_York"
@@ -403,6 +431,23 @@ class EconomicOracleTests(unittest.TestCase):
         oracle_a.add_events(workload.unique_events)
         oracle_b.add_events(workload.submitted_events)
         self.assertEqual(oracle_a.compute_economic_sha256(), oracle_b.compute_economic_sha256())
+
+    def test_chaos_outage_events_are_buffered_within_six_hour_window(self) -> None:
+        workload = generate_chaos_workload(
+            unique_count=1000,
+            store_count=10,
+            outage_stores=2,
+            terminals_per_store=2,
+            seed=43,
+        )
+        outage_stores = set(workload.outage_store_ids)
+        outage_events = [event for event in workload.unique_events if event["store_id"] in outage_stores]
+
+        self.assertTrue(outage_events)
+        for event in outage_events:
+            occurred_at = datetime.fromisoformat(event["occurred_at"].replace("Z", "+00:00"))
+            self.assertGreaterEqual(occurred_at, workload.simulated_now - timedelta(hours=6))
+            self.assertLessEqual(occurred_at, workload.simulated_now)
 
 
 class OfflineSimulatorTests(unittest.TestCase):

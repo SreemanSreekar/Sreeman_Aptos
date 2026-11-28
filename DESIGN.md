@@ -1,4 +1,4 @@
-# `Sreeman_Aptos` — Offline-First POS Distributed Ledger Architecture & Trade-Offs
+  # `Sreeman_Aptos` — Offline-First POS Distributed Ledger Architecture & Trade-Offs
 
 This document summarizes the locked **Phase 1 & Phase 2 (v10)** architecture, correctness invariants, and engineering trade-offs for the 300-store, 2,400-terminal offline-first grocery POS ledger.
 

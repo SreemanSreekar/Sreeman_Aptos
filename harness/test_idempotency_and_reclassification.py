@@ -210,50 +210,53 @@ class TestIdempotencyAndReclassification(unittest.IsolatedAsyncioTestCase):
 
     async def test_reversed_batch_and_separate_tx_late_void_rebuilds(self) -> None:
         cfg = HarnessConfig()
+        store_id = f"store-reclass-{uuid.uuid4().hex[:8]}"
+        empty_account_id = f"loy-rebuild-{uuid.uuid4().hex[:8]}"
         t0 = datetime(2026, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
         now = t0 + timedelta(minutes=20)
         async with LedgerClient(cfg.base_url) as client:
             await client.admin_seed(
                 stores=[
                     {
-                        "store_id": "store-reclass-1",
+                        "store_id": store_id,
                         "iana_timezone": "America/New_York",
                         "terminal_ids": ["term-1"],
                     }
                 ],
+                loyalty_accounts=[{"account_id": empty_account_id}],
                 simulated_now=now,
             )
 
             sid_c = str(uuid.uuid4())
             sale_c = make_sale_event(
-                store_id="store-reclass-1",
+                store_id=store_id,
                 terminal_id="term-1",
                 occurred_at=t0,
                 amount_minor=5000,
                 sale_id=sid_c,
             )
             ret_c = make_return_event(
-                store_id="store-reclass-1",
+                store_id=store_id,
                 terminal_id="term-1",
                 occurred_at=t0 + timedelta(minutes=5),
                 parent_sale_id=sid_c,
                 amount_minor=2000,
             )
             void_c = make_void_event(
-                store_id="store-reclass-1",
+                store_id=store_id,
                 terminal_id="term-1",
                 occurred_at=t0 + timedelta(minutes=2),
                 parent_sale_id=sid_c,
                 amount_minor=5000,
             )
             await client.post_batch(
-                store_id="store-reclass-1",
+                store_id=store_id,
                 terminal_id="term-1",
                 events=[sale_c],
                 simulated_now=now,
             )
             await client.post_batch(
-                store_id="store-reclass-1",
+                store_id=store_id,
                 terminal_id="term-1",
                 events=[ret_c, void_c],
                 simulated_now=now,
@@ -261,34 +264,34 @@ class TestIdempotencyAndReclassification(unittest.IsolatedAsyncioTestCase):
 
             sid_d = str(uuid.uuid4())
             sale_d = make_sale_event(
-                store_id="store-reclass-1",
+                store_id=store_id,
                 terminal_id="term-1",
                 occurred_at=t0,
                 amount_minor=6000,
                 sale_id=sid_d,
             )
             ret_d = make_return_event(
-                store_id="store-reclass-1",
+                store_id=store_id,
                 terminal_id="term-1",
                 occurred_at=t0 + timedelta(minutes=5),
                 parent_sale_id=sid_d,
                 amount_minor=2500,
             )
             void_d = make_void_event(
-                store_id="store-reclass-1",
+                store_id=store_id,
                 terminal_id="term-1",
                 occurred_at=t0 + timedelta(minutes=2),
                 parent_sale_id=sid_d,
                 amount_minor=6000,
             )
             await client.post_batch(
-                store_id="store-reclass-1",
+                store_id=store_id,
                 terminal_id="term-1",
                 events=[sale_d],
                 simulated_now=now,
             )
             await client.post_batch(
-                store_id="store-reclass-1",
+                store_id=store_id,
                 terminal_id="term-1",
                 events=[ret_d],
                 simulated_now=now,
@@ -297,7 +300,7 @@ class TestIdempotencyAndReclassification(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snap_resp.status_code, 200, snap_resp.text)
 
             await client.post_batch(
-                store_id="store-reclass-1",
+                store_id=store_id,
                 terminal_id="term-1",
                 events=[void_d],
                 simulated_now=now,
@@ -308,13 +311,20 @@ class TestIdempotencyAndReclassification(unittest.IsolatedAsyncioTestCase):
             full_sha = (await client.get_checksum()).json()["read_model_sha256"]
             await client.admin_rebuild(mode="snapshot")
             snap_tail_sha = (await client.get_checksum()).json()["read_model_sha256"]
+            account_resp = await client.get_loyalty(empty_account_id)
 
             self.assertEqual(live_sha, full_sha)
             self.assertEqual(live_sha, snap_tail_sha)
+            self.assertEqual(account_resp.status_code, 200, account_resp.text)
+            self.assertEqual(account_resp.json()["balance"], 0)
 
     async def test_concurrent_batch_vs_online_race_same_event_id(self) -> None:
         cfg = HarnessConfig()
-        u1, u2, _ = cfg.endpoint_pair()
+        u1, u2, _ = cfg.endpoint_pair(require_distinct=True)
+        run_id = uuid.uuid4().hex[:8]
+        store_id = f"store-race-{run_id}"
+        card_id = f"gc-race-{run_id}"
+        account_id = f"loy-race-{run_id}"
         now = datetime(2026, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
         race_gc_eid = str(uuid.uuid4())
         race_loy_eid = str(uuid.uuid4())
@@ -326,42 +336,42 @@ class TestIdempotencyAndReclassification(unittest.IsolatedAsyncioTestCase):
             await r1.admin_seed(
                 stores=[
                     {
-                        "store_id": "store-race-1",
+                        "store_id": store_id,
                         "iana_timezone": "America/New_York",
                         "terminal_ids": ["term-1"],
                     }
                 ],
                 gift_cards=[
                     {
-                        "card_id": "gc-race-1",
+                        "card_id": card_id,
                         "initial_balance_minor": 5000,
-                        "eligible_stores": ["store-race-1"],
+                        "eligible_stores": [store_id],
                     }
                 ],
-                loyalty_accounts=[{"account_id": "loy-race-1"}],
+                loyalty_accounts=[{"account_id": account_id}],
                 simulated_now=now,
             )
 
             earn_ev = make_loyalty_event(
                 event_type="loyalty_earn",
-                store_id="store-race-1",
+                store_id=store_id,
                 terminal_id="term-1",
                 occurred_at=now - timedelta(minutes=2),
-                account_id="loy-race-1",
+                account_id=account_id,
                 points=1000,
             )
             await r1.post_batch(
-                store_id="store-race-1",
+                store_id=store_id,
                 terminal_id="term-1",
                 events=[earn_ev],
                 simulated_now=now,
             )
 
             gc_ev = make_giftcard_redeem_event(
-                store_id="store-race-1",
+                store_id=store_id,
                 terminal_id="term-1",
                 occurred_at=now - timedelta(seconds=10),
-                card_id="gc-race-1",
+                card_id=card_id,
                 amount_minor=1500,
                 epoch_gen=1,
                 terminal_epoch_seq=1,
@@ -369,10 +379,10 @@ class TestIdempotencyAndReclassification(unittest.IsolatedAsyncioTestCase):
             )
             loy_ev = make_loyalty_event(
                 event_type="loyalty_burn",
-                store_id="store-race-1",
+                store_id=store_id,
                 terminal_id="term-1",
                 occurred_at=now - timedelta(seconds=5),
-                account_id="loy-race-1",
+                account_id=account_id,
                 points=300,
                 epoch_gen=1,
                 terminal_epoch_seq=2,
@@ -381,31 +391,31 @@ class TestIdempotencyAndReclassification(unittest.IsolatedAsyncioTestCase):
 
             gc_batch, gc_online, loy_batch, loy_online = await asyncio.gather(
                 r1.post_batch(
-                    store_id="store-race-1",
+                    store_id=store_id,
                     terminal_id="term-1",
                     events=[gc_ev],
                     simulated_now=now,
                 ),
                 r2.online_redeem_giftcard(
                     event_id=race_gc_eid,
-                    store_id="store-race-1",
+                    store_id=store_id,
                     terminal_id="term-1",
-                    card_id="gc-race-1",
+                    card_id=card_id,
                     amount_minor=1500,
                     occurred_at=now - timedelta(seconds=10),
                     simulated_now=now,
                 ),
                 r1.post_batch(
-                    store_id="store-race-1",
+                    store_id=store_id,
                     terminal_id="term-1",
                     events=[loy_ev],
                     simulated_now=now,
                 ),
                 r2.online_burn_loyalty(
                     event_id=race_loy_eid,
-                    store_id="store-race-1",
+                    store_id=store_id,
                     terminal_id="term-1",
-                    account_id="loy-race-1",
+                    account_id=account_id,
                     points=300,
                     occurred_at=now - timedelta(seconds=5),
                     simulated_now=now,
@@ -416,21 +426,26 @@ class TestIdempotencyAndReclassification(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(loy_batch.status_code, 200, loy_batch.text)
             self.assertEqual(loy_online.status_code, 200, loy_online.text)
 
-            gc = (await r1.get_giftcard("gc-race-1")).json()
+            gc = (await r1.get_giftcard(card_id)).json()
             self.assertEqual(gc["balance_minor"], 3500)
-            loy = (await r1.get_loyalty("loy-race-1")).json()
+            loy = (await r1.get_loyalty(account_id)).json()
             self.assertEqual(loy["balance"], 700)
 
         oracle = EconomicOracle()
-        oracle.seed_store("store-race-1", "America/New_York", ["term-1"])
-        oracle.seed_gift_card("gc-race-1", 5000, ["store-race-1"])
-        oracle.seed_loyalty_account("loy-race-1")
+        oracle.seed_store(store_id, "America/New_York", ["term-1"])
+        oracle.seed_gift_card(card_id, 5000, [store_id])
+        oracle.seed_loyalty_account(account_id)
         oracle.add_events([earn_ev, gc_ev, loy_ev])
-        async with LedgerClient(cfg.base_url) as base:
-            self.assertEqual(
-                (await base.get_checksum()).json()["economic_sha256"],
-                oracle.compute_economic_sha256(),
-            )
+        oracle.evaluate()
+        self.assertEqual(gc["balance_minor"], oracle.gift_cards[card_id].balance_minor)
+        self.assertEqual(loy["balance"], oracle.loyalty_accounts[account_id].balance)
+
+        db = DbInspector(cfg.app_dsn)
+        persisted_race_events = await db.fetch_scalar(
+            "SELECT COUNT(*) FROM ledger_events WHERE event_id = ANY(%s::uuid[])",
+            ([race_gc_eid, race_loy_eid],),
+        )
+        self.assertEqual(persisted_race_events, 2)
 
 
 if __name__ == "__main__":

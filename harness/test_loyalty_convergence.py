@@ -82,64 +82,68 @@ class TestLoyaltyOracleConvergenceUnit(unittest.TestCase):
 class TestLoyaltyConvergence(unittest.IsolatedAsyncioTestCase):
     async def test_opposite_permutation_convergence_online_block_and_recovery(self) -> None:
         cfg = HarnessConfig()
+        run_id = uuid.uuid4().hex[:8]
+        store_one = f"store-loy-{run_id}-1"
+        store_two = f"store-loy-{run_id}-2"
+        account_id = f"loy-conv-{run_id}"
         t0 = datetime(2026, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
         now = t0 + timedelta(minutes=20)
 
         stores = [
-            {"store_id": "store-loy-1", "iana_timezone": "America/New_York", "terminal_ids": ["t1", "t2"]},
-            {"store_id": "store-loy-2", "iana_timezone": "America/Chicago", "terminal_ids": ["t1"]},
+            {"store_id": store_one, "iana_timezone": "America/New_York", "terminal_ids": ["t1", "t2"]},
+            {"store_id": store_two, "iana_timezone": "America/Chicago", "terminal_ids": ["t1"]},
         ]
 
         burn_a = make_loyalty_event(
             event_type="loyalty_burn",
-            store_id="store-loy-1",
+            store_id=store_one,
             terminal_id="t1",
             occurred_at=t0,
-            account_id="loy-conv-1",
+            account_id=account_id,
             points=500,
             epoch_gen=1,
             terminal_epoch_seq=1,
         )
         burn_b = make_loyalty_event(
             event_type="loyalty_burn",
-            store_id="store-loy-2",
+            store_id=store_two,
             terminal_id="t1",
             occurred_at=t0 + timedelta(minutes=1),
-            account_id="loy-conv-1",
+            account_id=account_id,
             points=300,
             epoch_gen=1,
             terminal_epoch_seq=1,
         )
         earn_small = make_loyalty_event(
             event_type="loyalty_earn",
-            store_id="store-loy-1",
+            store_id=store_one,
             terminal_id="t2",
             occurred_at=t0 + timedelta(minutes=2),
-            account_id="loy-conv-1",
+            account_id=account_id,
             points=200,
         )
 
-        u1, u2, _ = cfg.endpoint_pair()
+        u1, u2, _ = cfg.endpoint_pair(require_distinct=True)
         async with (
             LedgerClient(u1) as r1,
             LedgerClient(u2) as r2,
         ):
             await r1.admin_seed(
                 stores=stores,
-                loyalty_accounts=[{"account_id": "loy-conv-1"}],
+                loyalty_accounts=[{"account_id": account_id}],
                 simulated_now=now,
             )
 
             # Upload opposite permutations across replicas
             resp_a, resp_b = await asyncio.gather(
                 r1.post_batch(
-                    store_id="store-loy-1",
+                    store_id=store_one,
                     terminal_id="t1",
                     events=[burn_a, earn_small],
                     simulated_now=now,
                 ),
                 r2.post_batch(
-                    store_id="store-loy-2",
+                    store_id=store_two,
                     terminal_id="t1",
                     events=[burn_b],
                     simulated_now=now,
@@ -148,7 +152,7 @@ class TestLoyaltyConvergence(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resp_a.status_code, 200, resp_a.text)
             self.assertEqual(resp_b.status_code, 200, resp_b.text)
 
-            acct = (await r1.get_loyalty("loy-conv-1")).json()
+            acct = (await r1.get_loyalty(account_id)).json()
             self.assertEqual(acct["balance"], -600)
             self.assertEqual(acct["status"], "NEGATIVE_RESTRICTED")
 
@@ -156,9 +160,9 @@ class TestLoyaltyConvergence(unittest.IsolatedAsyncioTestCase):
             blocked_eid = str(uuid.uuid4())
             r_block = await r1.online_burn_loyalty(
                 event_id=blocked_eid,
-                store_id="store-loy-1",
+                store_id=store_one,
                 terminal_id="t1",
-                account_id="loy-conv-1",
+                account_id=account_id,
                 points=50,
                 occurred_at=now + timedelta(seconds=5),
                 simulated_now=now + timedelta(seconds=5),
@@ -169,9 +173,9 @@ class TestLoyaltyConvergence(unittest.IsolatedAsyncioTestCase):
             # Replay exact same online request -> claim-first receipt returns stored 409
             r_block_retry = await r2.online_burn_loyalty(
                 event_id=blocked_eid,
-                store_id="store-loy-1",
+                store_id=store_one,
                 terminal_id="t1",
-                account_id="loy-conv-1",
+                account_id=account_id,
                 points=50,
                 occurred_at=now + timedelta(seconds=5),
                 simulated_now=now + timedelta(seconds=5),
@@ -181,19 +185,19 @@ class TestLoyaltyConvergence(unittest.IsolatedAsyncioTestCase):
             # Earn-back restores ACTIVE
             earn_back = make_loyalty_event(
                 event_type="loyalty_earn",
-                store_id="store-loy-1",
+                store_id=store_one,
                 terminal_id="t2",
                 occurred_at=now + timedelta(seconds=10),
-                account_id="loy-conv-1",
+                account_id=account_id,
                 points=1000,
             )
             await r1.post_batch(
-                store_id="store-loy-1",
+                store_id=store_one,
                 terminal_id="t2",
                 events=[earn_back],
                 simulated_now=now + timedelta(seconds=15),
             )
-            acct_after = (await r1.get_loyalty("loy-conv-1")).json()
+            acct_after = (await r1.get_loyalty(account_id)).json()
             self.assertEqual(acct_after["balance"], 400)
             self.assertEqual(acct_after["status"], "ACTIVE")
 
@@ -201,25 +205,25 @@ class TestLoyaltyConvergence(unittest.IsolatedAsyncioTestCase):
             ok_eid = str(uuid.uuid4())
             b1 = await r1.online_burn_loyalty(
                 event_id=ok_eid,
-                store_id="store-loy-1",
+                store_id=store_one,
                 terminal_id="t1",
-                account_id="loy-conv-1",
+                account_id=account_id,
                 points=150,
                 occurred_at=now + timedelta(seconds=20),
                 simulated_now=now + timedelta(seconds=20),
             )
             b2 = await r2.online_burn_loyalty(
                 event_id=ok_eid,
-                store_id="store-loy-1",
+                store_id=store_one,
                 terminal_id="t1",
-                account_id="loy-conv-1",
+                account_id=account_id,
                 points=150,
                 occurred_at=now + timedelta(seconds=20),
                 simulated_now=now + timedelta(seconds=20),
             )
             self.assertEqual(b1.status_code, 200, b1.text)
             self.assertEqual(b2.status_code, 200, b2.text)
-            acct_final = (await r1.get_loyalty("loy-conv-1")).json()
+            acct_final = (await r1.get_loyalty(account_id)).json()
             self.assertEqual(acct_final["balance"], 250)
 
 
