@@ -117,10 +117,14 @@ $env:LEDGER_REPLICA2_URL = "http://localhost:8083"
 $env:POSTGRES_HOST_PORT = "5434"
 
 # Windows: psycopg async connections require a Selector event loop.
-python -c "import asyncio, pytest; asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy()); raise SystemExit(pytest.main(['-q', 'harness']))"
+# Run non-chaos suites first (33 tests), then reset the test volume and run the 100K chaos replay.
+python -c "import asyncio, pytest; asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy()); raise SystemExit(pytest.main(['-q', 'harness', '--ignore=harness/test_100k_chaos_replay.py']))"
+docker compose -p sreeman-acceptance -f docker-compose.test.yml down -v
+docker compose -p sreeman-acceptance -f docker-compose.test.yml up -d --build
+python -c "import asyncio, pytest; asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy()); raise SystemExit(pytest.main(['-q', 'harness/test_100k_chaos_replay.py']))"
 ```
 
-On Linux/macOS, run `python -m pytest -q harness` after setting the same integration variables. Run the 100K chaos replay last because it intentionally leaves its workload in the test database; reset the test volume before any later full-ledger checksum run.
+On Linux/macOS, run `python -m pytest -q harness --ignore=harness/test_100k_chaos_replay.py` followed by a fresh volume reset and `python -m pytest -q harness/test_100k_chaos_replay.py` (with the same integration variables). `harness/conftest.py` also enforces running `test_100k_chaos_replay.py` last if `python -m pytest -q harness` is invoked directly; reset the test volume before any later full-ledger checksum run.
 
 ### Current Acceptance Evidence
 

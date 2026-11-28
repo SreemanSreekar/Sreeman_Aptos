@@ -24,11 +24,11 @@ const (
 )
 
 var (
-	ErrInvalidAmount            = errors.New("INVALID_AMOUNT")
-	ErrTerminalLocalFenced      = errors.New("TERMINAL_LOCAL_FENCED")
-	ErrBootIDChanged            = errors.New("OFFLINE_REBOOT_FENCED")
-	ErrClockRollback            = errors.New("CLOCK_ROLLBACK_DETECTED")
-	ErrOfflineSliceExpired      = errors.New("OFFLINE_SLICE_EXPIRED")
+	ErrInvalidAmount             = errors.New("INVALID_AMOUNT")
+	ErrTerminalLocalFenced       = errors.New("TERMINAL_LOCAL_FENCED")
+	ErrBootIDChanged             = errors.New("OFFLINE_REBOOT_FENCED")
+	ErrClockRollback             = errors.New("CLOCK_ROLLBACK_DETECTED")
+	ErrOfflineSliceExpired       = errors.New("OFFLINE_SLICE_EXPIRED")
 	ErrOfflineStoreNotEligible   = errors.New("OFFLINE_STORE_NOT_ELIGIBLE")
 	ErrCardNotFound              = errors.New("CARD_NOT_FOUND")
 	ErrCardNotActive             = errors.New("CARD_NOT_ACTIVE")
