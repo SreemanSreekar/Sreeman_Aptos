@@ -507,9 +507,15 @@ class OfflineSimulatorTests(unittest.TestCase):
         self.assertEqual(ctx2.exception.code, "CARD_FROZEN")
 
     def test_boottime_ttl_expiry_reboot_rollback_and_rtt_guards(self) -> None:
-        # 1. TTL expiry via CLOCK_BOOTTIME (6h = 21,600s)
+        # 1. Drift-tightened TTL boundary via CLOCK_BOOTTIME (6h minus 1000 ppm = 21,578,400 ms)
+        sim_ok = self._make_terminal()
+        assert sim_ok.grant is not None
+        sim_ok.clock.boottime_ms = sim_ok.grant.grant_boottime_ms + 21_578_399
+        sim_ok.redeem_giftcard_offline(card_id="gc-1", amount_minor=100)
+
         sim = self._make_terminal()
-        sim.clock.advance(21_600)
+        assert sim.grant is not None
+        sim.clock.boottime_ms = sim.grant.grant_boottime_ms + 21_578_400
         with self.assertRaises(OfflineRuleError) as ctx_ttl:
             sim.redeem_giftcard_offline(card_id="gc-1", amount_minor=100)
         self.assertEqual(ctx_ttl.exception.code, "SLICE_BOOTTIME_TTL_EXPIRED")
@@ -521,14 +527,19 @@ class OfflineSimulatorTests(unittest.TestCase):
             sim_reboot.redeem_giftcard_offline(card_id="gc-1", amount_minor=100)
         self.assertEqual(ctx_reb.exception.code, "OFFLINE_REBOOT_DETECTED")
 
-        # 3. Backward wall-clock rollback fails closed
+        # 3. Backward wall-clock rollback permanently fences even if clock later recovers
         sim_back = self._make_terminal()
         sim_back.clock.advance(60)
         sim_back.redeem_giftcard_offline(card_id="gc-1", amount_minor=100)
+        recovered_wall = sim_back.clock.wall_utc + timedelta(minutes=1)
         sim_back.clock.tamper_wall_clock(sim_back.clock.wall_utc - timedelta(minutes=5))
         with self.assertRaises(OfflineRuleError) as ctx_hwm:
             sim_back.redeem_giftcard_offline(card_id="gc-1", amount_minor=100)
         self.assertEqual(ctx_hwm.exception.code, "CLOCK_ROLLBACK_DETECTED")
+        sim_back.clock.tamper_wall_clock(recovered_wall)
+        with self.assertRaises(OfflineRuleError) as ctx_fenced:
+            sim_back.redeem_giftcard_offline(card_id="gc-1", amount_minor=100)
+        self.assertEqual(ctx_fenced.exception.code, "LOCAL_SLICE_FENCED")
 
         # 4. Sync RTT > 30s discarded
         t0 = datetime(2026, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
