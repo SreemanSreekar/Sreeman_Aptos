@@ -21,7 +21,15 @@ from typing import Any
 from harness.canonical import parse_utc
 
 DEFAULT_TTL_MS = 6 * 3600 * 1000  # 21,600,000 ms
+DEFAULT_MAX_DRIFT_PPM = 1000  # 0.1% bounded hardware oscillator drift (matches pos_ruleset)
 DEFAULT_MAX_RTT_MS = 30 * 1000  # 30,000 ms
+
+
+def effective_boottime_ttl_ms(
+    ttl_ms: int = DEFAULT_TTL_MS, max_drift_ppm: int = DEFAULT_MAX_DRIFT_PPM
+) -> int:
+    """Return boottime TTL tightened by bounded oscillator drift (matches Go pos_ruleset)."""
+    return ttl_ms - (ttl_ms * max_drift_ppm) // 1_000_000
 
 
 class OfflineRuleError(Exception):
@@ -176,11 +184,12 @@ class OfflineTerminalSimulator:
                 f"wall_clock {self.clock.wall_utc.isoformat()} < hwm {grant.hwm_utc.isoformat()}",
             )
         elapsed_ms = self.clock.boottime_ms - grant.grant_boottime_ms
-        if elapsed_ms < 0 or elapsed_ms >= grant.ttl_ms:
+        eff_ttl_ms = effective_boottime_ttl_ms(grant.ttl_ms)
+        if elapsed_ms < 0 or elapsed_ms >= eff_ttl_ms:
             grant.local_fenced = True
             raise OfflineRuleError(
                 "SLICE_BOOTTIME_TTL_EXPIRED",
-                f"elapsed {elapsed_ms}ms >= TTL {grant.ttl_ms}ms",
+                f"elapsed {elapsed_ms}ms >= effective TTL {eff_ttl_ms}ms",
             )
         if self.clock.wall_utc >= grant.slice_expires_at_utc:
             grant.local_fenced = True

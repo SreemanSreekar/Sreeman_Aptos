@@ -184,6 +184,9 @@ CREATE INDEX idx_ledger_events_card_store_epoch
     WHERE event_type = 'giftcard_redeem' AND channel = 'OFFLINE';
 CREATE INDEX idx_ledger_events_account_prefix
     ON ledger_events (account_id, applied_order) WHERE account_id IS NOT NULL;
+CREATE INDEX idx_ledger_events_loyalty_store_epoch
+    ON ledger_events (store_id, epoch_gen, applied_order)
+    WHERE event_type = 'loyalty_burn' AND channel = 'OFFLINE';
 CREATE INDEX idx_ledger_events_commit_xid
     ON ledger_events (commit_xid);
 CREATE UNIQUE INDEX uq_ledger_events_terminal_epoch_seq
@@ -763,6 +766,7 @@ BEGIN
     SELECT COUNT(*) INTO v_omitted_count
     FROM ledger_events le
     WHERE le.channel = 'OFFLINE'
+      AND le.terminal_epoch_seq IS NOT NULL
       AND le.store_id = p_store_id
       AND le.terminal_id = p_terminal_id
       AND le.epoch_gen = p_epoch_gen
@@ -775,6 +779,7 @@ BEGIN
       INTO v_actual_count, v_min_seq, v_max_seq, v_distinct_seq
     FROM ledger_events le
     WHERE le.channel = 'OFFLINE'
+      AND le.terminal_epoch_seq IS NOT NULL
       AND le.store_id = p_store_id
       AND le.terminal_id = p_terminal_id
       AND le.epoch_gen = p_epoch_gen;

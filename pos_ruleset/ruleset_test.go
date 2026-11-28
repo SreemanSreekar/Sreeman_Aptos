@@ -67,27 +67,37 @@ func TestCanRedeemGiftCard_IneligibleStore(t *testing.T) {
 }
 
 func TestCanRedeemGiftCard_RebootAndRollbackAndTTL(t *testing.T) {
-	g := testGrant()
-	wall := g.IssuedAtUTC.Add(time.Minute)
-
-	// Backward clock rollback
-	if err := CanRedeemGiftCard(g, "GC-1", 100, "boot-1", 160_000, g.IssuedAtUTC.Add(-time.Second)); !errors.Is(err, ErrClockRollback) {
+	// Backward clock rollback permanently fences locally even if clock later recovers
+	gRollback := testGrant()
+	wall := gRollback.IssuedAtUTC.Add(time.Minute)
+	if err := CanRedeemGiftCard(gRollback, "GC-1", 100, "boot-1", 160_000, gRollback.IssuedAtUTC.Add(-time.Second)); !errors.Is(err, ErrClockRollback) {
 		t.Fatalf("expected ErrClockRollback, got %v", err)
 	}
+	if !gRollback.LocalFenced {
+		t.Fatalf("expected LocalFenced=true after wall-clock rollback")
+	}
+	if err := CanRedeemGiftCard(gRollback, "GC-1", 100, "boot-1", 161_000, wall); !errors.Is(err, ErrTerminalLocalFenced) {
+		t.Fatalf("expected ErrTerminalLocalFenced on post-rollback recovery spend, got %v", err)
+	}
 
-	// Boottime TTL expired (>= 6h)
-	if err := CanRedeemGiftCard(g, "GC-1", 100, "boot-1", g.GrantBoottimeMs+OfflineSliceTTLMs, wall); !errors.Is(err, ErrOfflineSliceExpired) {
+	// Boottime TTL expired (>= 6h) permanently fences locally
+	gTTL := testGrant()
+	if err := CanRedeemGiftCard(gTTL, "GC-1", 100, "boot-1", gTTL.GrantBoottimeMs+OfflineSliceTTLMs, wall); !errors.Is(err, ErrOfflineSliceExpired) {
 		t.Fatalf("expected ErrOfflineSliceExpired on boottime, got %v", err)
+	}
+	if !gTTL.LocalFenced {
+		t.Fatalf("expected LocalFenced=true after TTL expiry")
 	}
 
 	// Reboot changes boot_id and permanently fences locally
-	if err := CanRedeemGiftCard(g, "GC-1", 100, "boot-2", 160_000, wall); !errors.Is(err, ErrBootIDChanged) {
+	gReboot := testGrant()
+	if err := CanRedeemGiftCard(gReboot, "GC-1", 100, "boot-2", 160_000, wall); !errors.Is(err, ErrBootIDChanged) {
 		t.Fatalf("expected ErrBootIDChanged, got %v", err)
 	}
-	if !g.LocalFenced {
+	if !gReboot.LocalFenced {
 		t.Fatalf("expected LocalFenced=true after reboot")
 	}
-	if err := CanRedeemGiftCard(g, "GC-1", 100, "boot-1", 160_000, wall); !errors.Is(err, ErrTerminalLocalFenced) {
+	if err := CanRedeemGiftCard(gReboot, "GC-1", 100, "boot-1", 160_000, wall); !errors.Is(err, ErrTerminalLocalFenced) {
 		t.Fatalf("expected ErrTerminalLocalFenced, got %v", err)
 	}
 }
@@ -157,19 +167,26 @@ func TestClockHardening_EmptyBootIDBackwardBoottimeAndDriftTTL(t *testing.T) {
 		t.Fatalf("expected LocalFenced=true when BootID missing")
 	}
 
-	// Backward monotonic boottime must fail closed
+	// Backward monotonic boottime must fail closed and latch LocalFenced
 	gBack := testGrant()
 	if err := CanRedeemGiftCard(gBack, "GC-1", 100, "boot-1", gBack.GrantBoottimeMs-1, wall); !errors.Is(err, ErrClockRollback) {
 		t.Fatalf("expected ErrClockRollback on backward boottime, got %v", err)
 	}
+	if !gBack.LocalFenced {
+		t.Fatalf("expected LocalFenced=true on backward boottime")
+	}
+	if err := CanRedeemGiftCard(gBack, "GC-1", 100, "boot-1", gBack.GrantBoottimeMs+1000, wall); !errors.Is(err, ErrTerminalLocalFenced) {
+		t.Fatalf("expected ErrTerminalLocalFenced after boottime recovery, got %v", err)
+	}
 
 	// Drift-tightened TTL boundary (1000 ppm on 6h = 21.6s earlier)
-	gDrift := testGrant()
-	if err := CanRedeemGiftCard(gDrift, "GC-1", 100, "boot-1", gDrift.GrantBoottimeMs+EffectiveBoottimeTTLMs(), wall); !errors.Is(err, ErrOfflineSliceExpired) {
-		t.Fatalf("expected ErrOfflineSliceExpired at drift-tightened TTL boundary, got %v", err)
-	}
-	if err := CanRedeemGiftCard(gDrift, "GC-1", 100, "boot-1", gDrift.GrantBoottimeMs+EffectiveBoottimeTTLMs()-1, wall); err != nil {
+	gDriftOk := testGrant()
+	if err := CanRedeemGiftCard(gDriftOk, "GC-1", 100, "boot-1", gDriftOk.GrantBoottimeMs+EffectiveBoottimeTTLMs()-1, wall); err != nil {
 		t.Fatalf("expected redemption 1ms before drift-tightened TTL to succeed, got %v", err)
+	}
+	gDriftExp := testGrant()
+	if err := CanRedeemGiftCard(gDriftExp, "GC-1", 100, "boot-1", gDriftExp.GrantBoottimeMs+EffectiveBoottimeTTLMs(), wall); !errors.Is(err, ErrOfflineSliceExpired) {
+		t.Fatalf("expected ErrOfflineSliceExpired at drift-tightened TTL boundary, got %v", err)
 	}
 }
 

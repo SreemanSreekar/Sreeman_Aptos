@@ -109,7 +109,7 @@ class TestGiftCardOverspendAndOnline(unittest.IsolatedAsyncioTestCase):
             {
                 "card_id": card_ids[i],
                 "initial_balance_minor": 1000,
-                "eligible_stores": [store_ids[k] for k in range(1, 2 + (i % 5))],
+                "eligible_stores": [store_ids[k] for k in range(1, 3 + (i % 4))],
             }
             for i in range(1, 41)
         ]

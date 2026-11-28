@@ -203,6 +203,55 @@ class TestIdempotencyAndReclassificationPerson1(unittest.IsolatedAsyncioTestCase
             self.assertEqual(len(reclass), 1)
             self.assertEqual(reclass[0]["amount_delta_minor"], 2500)
 
+    async def test_orphan_void_before_sale_resolves_to_zero_net(self) -> None:
+        """Worked Example #2: void v-7 arrives before sale s-40 -> s-40 is voided and net total is 0."""
+        cfg = HarnessConfig()
+        t0 = datetime(2026, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+        now = t0 + timedelta(minutes=15)
+        store_id = f"store-p3-orphvoid-{uuid.uuid4().hex[:6]}"
+        admin_db = DbInspector(cfg.admin_dsn)
+        await admin_db.seed_store_sql(
+            store_id=store_id,
+            iana_timezone="America/New_York",
+            terminal_ids=["term-1"],
+            simulated_now=t0,
+        )
+
+        sale_id = str(uuid.uuid4())
+        void_ev = make_void_event(
+            store_id=store_id,
+            terminal_id="term-1",
+            occurred_at=t0 + timedelta(minutes=5),
+            parent_sale_id=sale_id,
+            amount_minor=4200,
+        )
+        sale_ev = make_sale_event(
+            store_id=store_id,
+            terminal_id="term-1",
+            occurred_at=t0,
+            amount_minor=4200,
+            sale_id=sale_id,
+            event_id=sale_id,
+        )
+
+        async with LedgerClient(cfg.base_url) as client:
+            r_void = await client.post_batch(
+                store_id=store_id, terminal_id="term-1", events=[void_ev], simulated_now=now
+            )
+            self.assertEqual(r_void.status_code, 200, r_void.text)
+            self.assertEqual(r_void.json()["parked"], 1)
+
+            r_sale = await client.post_batch(
+                store_id=store_id, terminal_id="term-1", events=[sale_ev], simulated_now=now
+            )
+            self.assertEqual(r_sale.status_code, 200, r_sale.text)
+            self.assertEqual(r_sale.json()["accepted"], 1)
+
+            tot = (await client.get_store_totals(store_id=store_id, day="2026-06-15")).json()
+            self.assertEqual(tot["totals"]["sales_minor"], 4200)
+            self.assertEqual(tot["totals"]["voids_minor"], 4200)
+            self.assertEqual(tot["totals"]["net_total_minor"], 0)
+
 
 @unittest.skipIf(_P2_SKIP is not None, _P2_SKIP or "")
 class TestIdempotencyAndReclassification(unittest.IsolatedAsyncioTestCase):

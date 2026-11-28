@@ -78,15 +78,19 @@ func checkLocalTimeAndFence(grant *LocalSliceGrant, currentBootID string, curren
 		return ErrBootIDChanged
 	}
 	if !grant.HWMUTC.IsZero() && currentWallUTC.Before(grant.HWMUTC) {
+		grant.LocalFenced = true
 		return ErrClockRollback
 	}
 	if currentBoottimeMs < grant.GrantBoottimeMs {
+		grant.LocalFenced = true
 		return ErrClockRollback
 	}
 	if currentBoottimeMs-grant.GrantBoottimeMs >= EffectiveBoottimeTTLMs() {
+		grant.LocalFenced = true
 		return ErrOfflineSliceExpired
 	}
 	if !grant.SliceExpiresAtUTC.IsZero() && !currentWallUTC.Before(grant.SliceExpiresAtUTC) {
+		grant.LocalFenced = true
 		return ErrOfflineSliceExpired
 	}
 	return nil

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -66,14 +67,14 @@ func encUUID(u *uuid.UUID) string {
 	return encText(&s)
 }
 
-func writeRow(b *strings.Builder, cols ...string) {
+func writeRow(w io.Writer, cols ...string) {
 	for i, c := range cols {
 		if i > 0 {
-			b.WriteByte('\t')
+			_, _ = io.WriteString(w, "\t")
 		}
-		b.WriteString(c)
+		_, _ = io.WriteString(w, c)
 	}
-	b.WriteByte('\n')
+	_, _ = io.WriteString(w, "\n")
 }
 
 // ComputeChecksums calculates economic_sha256, read_model_sha256, and event_count
@@ -98,10 +99,10 @@ func ComputeChecksums(ctx context.Context, tx pgx.Tx) (Result, error) {
 }
 
 func computeEconomicSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
-	var b strings.Builder
+	h := sha256.New()
 
 	// 1. #TABLE:economic_store_day_totals
-	b.WriteString("#TABLE:economic_store_day_totals\n")
+	_, _ = io.WriteString(h, "#TABLE:economic_store_day_totals\n")
 	rows, err := tx.Query(ctx, `
 		WITH adj AS (
 			SELECT
@@ -151,7 +152,7 @@ func computeEconomicSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 			rows.Close()
 			return "", err
 		}
-		writeRow(&b, encTextVal(storeID), encDate(&origDay), encInt(salesM), encInt(returnsM), encInt(voidsM), encInt(gcM), encInt(netM))
+		writeRow(h, encTextVal(storeID), encDate(&origDay), encInt(salesM), encInt(returnsM), encInt(voidsM), encInt(gcM), encInt(netM))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -160,7 +161,7 @@ func computeEconomicSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 	rows.Close()
 
 	// 2. #TABLE:sales
-	b.WriteString("#TABLE:sales\n")
+	_, _ = io.WriteString(h, "#TABLE:sales\n")
 	rows, err = tx.Query(ctx, `
 		SELECT sale_id, store_id, origin_business_day, status, original_amount_minor, returned_amount_minor
 		FROM sales
@@ -178,7 +179,7 @@ func computeEconomicSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 			rows.Close()
 			return "", err
 		}
-		writeRow(&b, encUUID(&saleID), encText(storeID), encDate(origDay), encTextVal(status), encInt(origAmt), encInt(retAmt))
+		writeRow(h, encUUID(&saleID), encText(storeID), encDate(origDay), encTextVal(status), encInt(origAmt), encInt(retAmt))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -187,7 +188,7 @@ func computeEconomicSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 	rows.Close()
 
 	// 3. #TABLE:gift_cards
-	b.WriteString("#TABLE:gift_cards\n")
+	_, _ = io.WriteString(h, "#TABLE:gift_cards\n")
 	rows, err = tx.Query(ctx, `
 		SELECT card_id, balance_minor, status
 		FROM gift_cards
@@ -202,7 +203,7 @@ func computeEconomicSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 			rows.Close()
 			return "", err
 		}
-		writeRow(&b, encTextVal(cardID), encInt(bal), encTextVal(status))
+		writeRow(h, encTextVal(cardID), encInt(bal), encTextVal(status))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -211,7 +212,7 @@ func computeEconomicSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 	rows.Close()
 
 	// 4. #TABLE:loyalty_accounts
-	b.WriteString("#TABLE:loyalty_accounts\n")
+	_, _ = io.WriteString(h, "#TABLE:loyalty_accounts\n")
 	rows, err = tx.Query(ctx, `
 		SELECT account_id, earned_total, burned_total, balance, status
 		FROM loyalty_accounts
@@ -226,7 +227,7 @@ func computeEconomicSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 			rows.Close()
 			return "", err
 		}
-		writeRow(&b, encTextVal(accID), encInt(earned), encInt(burned), encInt(bal), encTextVal(status))
+		writeRow(h, encTextVal(accID), encInt(earned), encInt(burned), encInt(bal), encTextVal(status))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -234,15 +235,14 @@ func computeEconomicSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 	}
 	rows.Close()
 
-	sum := sha256.Sum256([]byte(b.String()))
-	return hex.EncodeToString(sum[:]), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
-	var b strings.Builder
+	h := sha256.New()
 
 	// 1. #TABLE:store_business_days
-	b.WriteString("#TABLE:store_business_days\n")
+	_, _ = io.WriteString(h, "#TABLE:store_business_days\n")
 	rows, err := tx.Query(ctx, `
 		SELECT store_id, business_day, cutoff_utc, tz_version, status
 		FROM store_business_days
@@ -257,7 +257,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 			rows.Close()
 			return "", err
 		}
-		writeRow(&b, encTextVal(storeID), encDate(&day), encTime(&cutoff), encTextVal(tzVer), encTextVal(status))
+		writeRow(h, encTextVal(storeID), encDate(&day), encTime(&cutoff), encTextVal(tzVer), encTextVal(status))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -266,7 +266,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 	rows.Close()
 
 	// 2. #TABLE:store_day_totals
-	b.WriteString("#TABLE:store_day_totals\n")
+	_, _ = io.WriteString(h, "#TABLE:store_day_totals\n")
 	rows, err = tx.Query(ctx, `
 		SELECT store_id, business_day, sales_minor, returns_minor, voids_minor, giftcard_redeem_minor, adjustments_net_minor, net_total_minor
 		FROM store_day_totals
@@ -282,7 +282,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 			rows.Close()
 			return "", err
 		}
-		writeRow(&b, encTextVal(storeID), encDate(&day), encInt(sM), encInt(rM), encInt(vM), encInt(gcM), encInt(adjM), encInt(netM))
+		writeRow(h, encTextVal(storeID), encDate(&day), encInt(sM), encInt(rM), encInt(vM), encInt(gcM), encInt(adjM), encInt(netM))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -291,7 +291,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 	rows.Close()
 
 	// 3. #TABLE:store_day_adjustments
-	b.WriteString("#TABLE:store_day_adjustments\n")
+	_, _ = io.WriteString(h, "#TABLE:store_day_adjustments\n")
 	rows, err = tx.Query(ctx, `
 		SELECT store_id, posting_business_day, origin_business_day, event_id, entry_kind, revision, caused_by_event_id, event_type, amount_delta_minor
 		FROM store_day_adjustments
@@ -308,7 +308,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 			rows.Close()
 			return "", err
 		}
-		writeRow(&b, encTextVal(storeID), encDate(&postDay), encDate(&origDay), encUUID(&evID), encTextVal(entryKind), encInt(rev), encUUID(&causedByID), encTextVal(evType), encInt(amtDelta))
+		writeRow(h, encTextVal(storeID), encDate(&postDay), encDate(&origDay), encUUID(&evID), encTextVal(entryKind), encInt(rev), encUUID(&causedByID), encTextVal(evType), encInt(amtDelta))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -317,7 +317,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 	rows.Close()
 
 	// 4. #TABLE:sales
-	b.WriteString("#TABLE:sales\n")
+	_, _ = io.WriteString(h, "#TABLE:sales\n")
 	rows, err = tx.Query(ctx, `
 		SELECT sale_id, store_id, origin_business_day, status, original_amount_minor, returned_amount_minor, revision
 		FROM sales
@@ -335,7 +335,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 			rows.Close()
 			return "", err
 		}
-		writeRow(&b, encUUID(&saleID), encText(storeID), encDate(origDay), encTextVal(status), encInt(origAmt), encInt(retAmt), encInt(rev))
+		writeRow(h, encUUID(&saleID), encText(storeID), encDate(origDay), encTextVal(status), encInt(origAmt), encInt(retAmt), encInt(rev))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -344,7 +344,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 	rows.Close()
 
 	// 5. #TABLE:parked_events
-	b.WriteString("#TABLE:parked_events\n")
+	_, _ = io.WriteString(h, "#TABLE:parked_events\n")
 	rows, err = tx.Query(ctx, `
 		SELECT event_id, parent_sale_id, status, resolved_at_utc
 		FROM parked_events
@@ -360,7 +360,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 			rows.Close()
 			return "", err
 		}
-		writeRow(&b, encUUID(&evID), encUUID(&parentID), encTextVal(status), encTime(resolvedAt))
+		writeRow(h, encUUID(&evID), encUUID(&parentID), encTextVal(status), encTime(resolvedAt))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -369,7 +369,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 	rows.Close()
 
 	// 6. #TABLE:event_application_status
-	b.WriteString("#TABLE:event_application_status\n")
+	_, _ = io.WriteString(h, "#TABLE:event_application_status\n")
 	rows, err = tx.Query(ctx, `
 		SELECT event_id, status, rejection_reason
 		FROM event_application_status
@@ -385,7 +385,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 			rows.Close()
 			return "", err
 		}
-		writeRow(&b, encUUID(&evID), encTextVal(status), encText(reason))
+		writeRow(h, encUUID(&evID), encTextVal(status), encText(reason))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -394,7 +394,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 	rows.Close()
 
 	// 7. #TABLE:gift_cards
-	b.WriteString("#TABLE:gift_cards\n")
+	_, _ = io.WriteString(h, "#TABLE:gift_cards\n")
 	rows, err = tx.Query(ctx, `
 		SELECT card_id, balance_minor, status
 		FROM gift_cards
@@ -409,7 +409,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 			rows.Close()
 			return "", err
 		}
-		writeRow(&b, encTextVal(cardID), encInt(bal), encTextVal(status))
+		writeRow(h, encTextVal(cardID), encInt(bal), encTextVal(status))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -418,7 +418,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 	rows.Close()
 
 	// 8. #TABLE:giftcard_overspend_flags
-	b.WriteString("#TABLE:giftcard_overspend_flags\n")
+	_, _ = io.WriteString(h, "#TABLE:giftcard_overspend_flags\n")
 	rows, err = tx.Query(ctx, `
 		SELECT card_id, event_id, store_id, balance_after_minor, overspend_delta_minor
 		FROM giftcard_overspend_flags
@@ -434,7 +434,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 			rows.Close()
 			return "", err
 		}
-		writeRow(&b, encTextVal(cardID), encUUID(&evID), encTextVal(storeID), encInt(balAfter), encInt(delta))
+		writeRow(h, encTextVal(cardID), encUUID(&evID), encTextVal(storeID), encInt(balAfter), encInt(delta))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -443,7 +443,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 	rows.Close()
 
 	// 9. #TABLE:loyalty_accounts
-	b.WriteString("#TABLE:loyalty_accounts\n")
+	_, _ = io.WriteString(h, "#TABLE:loyalty_accounts\n")
 	rows, err = tx.Query(ctx, `
 		SELECT account_id, earned_total, burned_total, balance, status
 		FROM loyalty_accounts
@@ -458,7 +458,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 			rows.Close()
 			return "", err
 		}
-		writeRow(&b, encTextVal(accID), encInt(earned), encInt(burned), encInt(bal), encTextVal(status))
+		writeRow(h, encTextVal(accID), encInt(earned), encInt(burned), encInt(bal), encTextVal(status))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -467,7 +467,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 	rows.Close()
 
 	// 10. #TABLE:loyalty_negative_flags
-	b.WriteString("#TABLE:loyalty_negative_flags\n")
+	_, _ = io.WriteString(h, "#TABLE:loyalty_negative_flags\n")
 	rows, err = tx.Query(ctx, `
 		SELECT account_id, trigger_event_id, deficit_points, resolved_by_event_id
 		FROM loyalty_negative_flags
@@ -484,7 +484,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 			rows.Close()
 			return "", err
 		}
-		writeRow(&b, encTextVal(accID), encUUID(&trigID), encInt(deficit), encUUID(resolvedID))
+		writeRow(h, encTextVal(accID), encUUID(&trigID), encInt(deficit), encUUID(resolvedID))
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -492,8 +492,7 @@ func computeReadModelSHA256(ctx context.Context, tx pgx.Tx) (string, error) {
 	}
 	rows.Close()
 
-	sum := sha256.Sum256([]byte(b.String()))
-	return hex.EncodeToString(sum[:]), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 type Handler struct {
